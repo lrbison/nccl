@@ -65,6 +65,59 @@ ncclResult_t ncclTransportP2pConnect(struct ncclComm* comm, int channelId, int n
   return ncclSuccess;
 }
 
+static ncclResult_t ncclTransportCloseConnector(struct ncclComm* comm, struct ncclChannel* channel, int peer,
+                                                int connIndex, int send) {
+  struct ncclConnector* conn = send ? channel->peers[peer]->send + connIndex : channel->peers[peer]->recv + connIndex;
+  struct ncclConnInfo zeroConn = {};
+
+  if (conn->transportComm != NULL) NCCLCHECK(conn->transportComm->free(comm, conn));
+  memset(conn, 0, sizeof(*conn));
+
+  if (channel->devPeersHostPtr != NULL && channel->devPeersHostPtr[peer] != NULL) {
+    struct ncclConnInfo* devConn =
+      send ? channel->devPeersHostPtr[peer]->send + connIndex : channel->devPeersHostPtr[peer]->recv + connIndex;
+    CUDACHECK(cudaMemcpy(devConn, &zeroConn, sizeof(zeroConn), cudaMemcpyHostToDevice));
+  }
+  return ncclSuccess;
+}
+
+ncclResult_t ncclTransportClosePeer(struct ncclComm* comm, int peer) {
+  ncclResult_t ret = ncclSuccess;
+  int cudaDev = -1;
+
+  if (comm == NULL) return ncclInvalidArgument;
+  if (peer < 0 || peer >= comm->nRanks) {
+    WARN("ncclTransportClosePeer: peer rank %d is invalid for nRanks %d", peer, comm->nRanks);
+    return ncclInvalidArgument;
+  }
+  if (peer == comm->rank) return ncclSuccess;
+
+  CUDACHECKGOTO(cudaGetDevice(&cudaDev), ret, fail);
+  if (cudaDev != comm->cudaDev) CUDACHECKGOTO(cudaSetDevice(comm->cudaDev), ret, fail);
+
+  for (int c = 0; c < MAXCHANNELS; c++) {
+    struct ncclChannel* channel = comm->channels + c;
+    if (channel->id == -1 || channel->peers == NULL || channel->peers[peer] == NULL) continue;
+    for (int b = 0; b < NCCL_MAX_CONNS; b++) {
+      NCCLCHECKGOTO(ncclTransportCloseConnector(comm, channel, peer, b, 1), ret, fail);
+      NCCLCHECKGOTO(ncclTransportCloseConnector(comm, channel, peer, b, 0), ret, fail);
+    }
+  }
+
+  comm->connectSend[peer] = 0UL;
+  comm->connectRecv[peer] = 0UL;
+  INFO(NCCL_INIT, "comm %p rank %d disconnected transport peer %d", comm, comm->rank, peer);
+
+exit:
+  if (cudaDev != -1) {
+    if (ret == ncclSuccess) CUDACHECK(cudaSetDevice(cudaDev));
+    else CUDACHECKIGNORE(cudaSetDevice(cudaDev));
+  }
+  return ret;
+fail:
+  goto exit;
+}
+
 void dumpData(struct ncclConnect* data, int ndata) {
   for (int n = 0; n < ndata; n++) {
     printf("[%d] ", n);

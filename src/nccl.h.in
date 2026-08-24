@@ -50,7 +50,8 @@ typedef enum { ncclSuccess                 =  0,
                ncclRemoteError             =  6,
                ncclInProgress              =  7,
                ncclTimeout                 =  8,
-               ncclNumResults              =  9 } ncclResult_t;
+               ncclResourceNotReady        =  9,
+               ncclNumResults              = 10 } ncclResult_t;
 
 #define NCCL_CONFIG_UNDEF_INT INT_MIN
 #define NCCL_CONFIG_UNDEF_PTR NULL
@@ -82,6 +83,20 @@ typedef enum { ncclSuccess                 =  0,
 
 /* ncclCommRevoke flags */
 #define NCCL_REVOKE_DEFAULT 0x00 /* reserved for future use; must be 0 */
+
+#define NCCL_UNIQUE_ID_DEFAULT 0
+#define NCCL_UNIQUE_ID_RESHAPE 1
+
+#define NCCL_COMM_RESHAPE_DEFAULT 0
+#define NCCL_COMM_RESHAPE_LOCAL_ONLY 1
+
+#define NCCL_COMM_INIT_DEFAULT 0
+#define NCCL_COMM_INIT_REUSE_EXISTING 1
+
+typedef enum {
+  ncclRankMaskInactive = 0,
+  ncclRankMaskActive = 1,
+} ncclCommMaskValue_t;
 
 typedef enum {
   ncclHostCftDefault = NCCL_CONFIG_UNDEF_INT,
@@ -130,6 +145,7 @@ typedef struct ncclConfig_v23100 {
   int rmaEagerInit;
   int hostCftMode;
   int nvlsHostMode;
+  int commInitFlags;
 } ncclConfig_t;
 
 /* Config initializer must be assigned to initialize config structure when it is created.
@@ -161,6 +177,7 @@ typedef struct ncclConfig_v23100 {
   NCCL_CONFIG_UNDEF_INT,                    /* rmaEagerInit */          \
   NCCL_CONFIG_UNDEF_INT,                    /* hostCftMode */           \
   NCCL_CONFIG_UNDEF_INT,                    /* nvlsHostMode */          \
+  NCCL_CONFIG_UNDEF_INT,                    /* commInitFlags */         \
 }
 
 /* A single vendor-specific option expressed as a key-value pair. Multiple options can be
@@ -278,6 +295,10 @@ ncclResult_t pncclGetVersion(int *version);
 ncclResult_t  ncclGetUniqueId(ncclUniqueId* uniqueId);
 ncclResult_t pncclGetUniqueId(ncclUniqueId* uniqueId);
 
+/* Generate a communicator-scoped unique ID. */
+ncclResult_t  ncclCommGetUniqueId_v2(ncclComm_t comm, ncclUniqueId* uniqueId, int flags);
+ncclResult_t pncclCommGetUniqueId_v2(ncclComm_t comm, ncclUniqueId* uniqueId, int flags);
+
 /* Create a new communicator (multi thread/process version) with a configuration
  * set by users. */
 ncclResult_t  ncclCommInitRankConfig(ncclComm_t* comm, int nranks, ncclUniqueId commId, int rank, ncclConfig_t* config);
@@ -326,6 +347,25 @@ ncclResult_t pncclCommAbort(ncclComm_t comm);
  * revokeFlags must be NCCL_REVOKE_DEFAULT (0). */
 ncclResult_t  ncclCommRevoke(ncclComm_t comm, int revokeFlags);
 ncclResult_t pncclCommRevoke(ncclComm_t comm, int revokeFlags);
+
+/* Reshape active rank slots in-place without changing communicator object identity. */
+ncclResult_t  ncclCommReshape(ncclComm_t comm, int leaderRank, const int* joinList, int joinListLen,
+                              const int* leaveList, int leaveListLen, int flags);
+ncclResult_t pncclCommReshape(ncclComm_t comm, int leaderRank, const int* joinList, int joinListLen,
+                              const int* leaveList, int leaveListLen, int flags);
+
+ncclResult_t  ncclCommMaskGet(ncclComm_t comm, ncclCommMaskValue_t* mask);
+ncclResult_t pncclCommMaskGet(ncclComm_t comm, ncclCommMaskValue_t* mask);
+
+ncclResult_t  ncclCommMaskCountActive(ncclComm_t comm, int* count);
+ncclResult_t pncclCommMaskCountActive(ncclComm_t comm, int* count);
+
+ncclResult_t  ncclCommRediscoverDevices(ncclComm_t comm);
+ncclResult_t pncclCommRediscoverDevices(ncclComm_t comm);
+
+/* Release process-local network provider resources after communicators have been quiesced. */
+ncclResult_t  ncclNetQuiesce(void);
+ncclResult_t pncclNetQuiesce(void);
 
 /* Creates one or more communicators from an existing one.
  * Ranks with the same color will end up in the same communicator.

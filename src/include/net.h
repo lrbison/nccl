@@ -20,6 +20,8 @@ typedef char ncclNetHandle_t[NCCL_NET_HANDLE_MAXSIZE];
 ncclResult_t ncclNetInit(struct ncclComm* comm);
 ncclResult_t ncclNetInitFromParent(struct ncclComm* comm, struct ncclComm* parent);
 ncclResult_t ncclNetFinalize(struct ncclComm* comm);
+ncclResult_t ncclNetRediscover(struct ncclComm* comm);
+ncclResult_t ncclNetQuiesceInternal(void);
 ncclResult_t ncclNetGetDevCount(int netPluginIndex, int* nPhysDev, int* nVirtDev);
 ncclResult_t ncclNetSetVirtDevCount(int netPluginIndex, int nVirtDev);
 ncclResult_t ncclCollNetGetDevCount(int netPluginIndex, int* nPhysDev, int* nVirtDev);
@@ -41,6 +43,8 @@ ncclResult_t ncclGpuGdrSupport(struct ncclComm* comm, int* gdrSupport);
 extern NCCL_NET_DATA_IMPORT ncclNet_t ncclNetIb;
 extern NCCL_NET_DATA_IMPORT ncclNet_t ncclNetSocket;
 extern NCCL_NET_DATA_IMPORT ncclNet_t ncclNetNd;
+ncclResult_t ncclNetSocketRediscover();
+ncclResult_t ncclIbQuiesceDevices(void);
 
 #undef NCCL_NET_DATA_IMPORT
 

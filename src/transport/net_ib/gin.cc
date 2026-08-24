@@ -51,12 +51,15 @@ static std::mutex ncclGinIbGdakiLockMutex;
 static int ncclGinIbGdakiNDevs = -1;
 int ncclGinIbGdakiDevIndexes[MAX_IB_DEVS];
 
-ncclResult_t ncclGinIbGdakiInitOnce() {
-  std::lock_guard<std::mutex> lock(ncclGinIbGdakiLockMutex);
+static ncclResult_t ncclGinIbGdakiInitLocked() {
   if (ncclGinIbGdakiNDevs == -1) {
     int ndevs = 0;
     int64_t ginType = ncclParamGinType();
     if (ginType != -1 && ginType != NCCL_GIN_TYPE_GDAKI) {
+      ncclGinIbGdakiNDevs = 0;
+      return ncclSuccess;
+    }
+    if (ncclNIbDevs <= 0) {
       ncclGinIbGdakiNDevs = 0;
       return ncclSuccess;
     }
@@ -69,6 +72,17 @@ ncclResult_t ncclGinIbGdakiInitOnce() {
     ncclGinIbGdakiNDevs = ndevs;
   }
   return ncclSuccess;
+}
+
+void ncclGinIbGdakiResetDevices() {
+  std::lock_guard<std::mutex> lock(ncclGinIbGdakiLockMutex);
+  ncclGinIbGdakiNDevs = -1;
+  memset(ncclGinIbGdakiDevIndexes, 0, sizeof(ncclGinIbGdakiDevIndexes));
+}
+
+ncclResult_t ncclGinIbGdakiInitOnce() {
+  std::lock_guard<std::mutex> lock(ncclGinIbGdakiLockMutex);
+  return ncclGinIbGdakiInitLocked();
 }
 
 // Initlialize GDAKI or PROXY backend. ginType can force a particular backend.
@@ -245,6 +259,7 @@ ncclResult_t ncclGinIbGdakiInit(void** ctx, uint64_t commId, ncclDebugLogger_t l
 
 ncclResult_t ncclGinIbGdakiDevices(int* ndev) {
   std::lock_guard<std::mutex> lock(ncclGinIbGdakiLockMutex);
+  NCCLCHECK(ncclGinIbGdakiInitLocked());
   *ndev = ncclGinIbGdakiNDevs;
   return ncclSuccess;
 }
@@ -257,7 +272,8 @@ ncclResult_t ncclGinIbGdakiGetGinProperties(ncclGinProperties_t* ginProps) {
 
 ncclResult_t ncclGinIbGdakiGetProperties(int dev, ncclNetProperties_t* props) {
   std::lock_guard<std::mutex> lock(ncclGinIbGdakiLockMutex);
-  if (dev >= ncclGinIbGdakiNDevs) {
+  NCCLCHECK(ncclGinIbGdakiInitLocked());
+  if (dev < 0 || dev >= ncclGinIbGdakiNDevs) {
     WARN("NET/IB : Requested properties for GIN GDAKI NIC %d, only %d GIN GDAKI NICs have been created", dev,
          ncclGinIbGdakiNDevs);
     return ncclInvalidUsage;
@@ -271,6 +287,8 @@ ncclResult_t ncclGinIbGdakiGetProperties(int dev, ncclNetProperties_t* props) {
 
 ncclResult_t ncclGinIbGdakiListen(void* ctx, int dev, void* opaqueHandle, void** listenComm) {
   std::lock_guard<std::mutex> lock(ncclGinIbGdakiLockMutex);
+  NCCLCHECK(ncclGinIbGdakiInitLocked());
+  if (dev < 0 || dev >= ncclGinIbGdakiNDevs) return ncclInvalidUsage;
   return ncclNetIb.listen(ctx, ncclGinIbGdakiDevIndexes[dev], opaqueHandle, listenComm);
 }
 

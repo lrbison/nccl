@@ -296,8 +296,211 @@ const char* ibProviderName[] = {
   "Mlx5",
 };
 
+static bool ncclIbContextSeen(struct ibv_context** contexts, int nContexts, struct ibv_context* context) {
+  for (int c = 0; c < nContexts; c++) {
+    if (contexts[c] == context) return true;
+  }
+  return false;
+}
+
+static ncclResult_t ncclIbSignalAsyncThreads(void);
+static ncclResult_t ncclIbJoinAsyncThreads(void);
+
+static ncclResult_t ncclIbStartAsyncThreads(void) {
+  ncclResult_t ret = ncclSuccess;
+  struct ibv_context* contexts[MAX_IB_DEVS];
+  int nContexts = 0;
+
+  for (int d = 0; d < ncclNIbDevs; d++) {
+    struct ibv_context* context = ncclIbDevs[d].context;
+    if (context == NULL || ncclIbContextSeen(contexts, nContexts, context)) continue;
+    contexts[nContexts++] = context;
+    struct ncclIbAsyncThreadState* state = ncclIbAsyncThreads + d;
+    if (state->thread != NULL) {
+      WARN("NET/IB: async thread for device %d is already running", d);
+      return ncclInternalError;
+    }
+    state->dev = ncclIbDevs + d;
+    state->stopPipe[0] = -1;
+    state->stopPipe[1] = -1;
+    SYSCHECKGOTO(pipe(state->stopPipe), "pipe", ret, fail);
+    NEW_NOTHROW_GOTO(state->thread, std::thread, ret, fail);
+    STDTHREADCREATE_GOTO(*state->thread, ncclIbAsyncThreadMain, ret, fail, state);
+    ncclSetThreadName(*state->thread, "NCCL IbAsync %2d", d);
+  }
+exit:
+  return ret;
+fail:
+  (void)ncclIbSignalAsyncThreads();
+  (void)ncclIbJoinAsyncThreads();
+  goto exit;
+}
+
+static ncclResult_t ncclIbCheckNoDeviceResources(void) {
+  ncclResult_t ret = ncclSuccess;
+
+  for (int d = 0; d < ncclNIbDevs; d++) {
+    if (ncclIbDevs[d].pdRefs != 0) {
+      WARN("NET/IB: cannot quiesce device %s:%d with pdRefs=%d", ncclIbDevs[d].devName, ncclIbDevs[d].portNum,
+           ncclIbDevs[d].pdRefs);
+      ret = ncclInternalError;
+    }
+    if (ncclIbDevs[d].mrCache.population != 0) {
+      WARN("NET/IB: cannot quiesce device %s:%d with %d registered MR cache entries", ncclIbDevs[d].devName,
+           ncclIbDevs[d].portNum, ncclIbDevs[d].mrCache.population);
+      ret = ncclInternalError;
+    }
+  }
+  return ret;
+}
+
+static ncclResult_t ncclIbSignalAsyncThreads(void) {
+  ncclResult_t ret = ncclSuccess;
+  char stop = 1;
+
+  for (int d = 0; d < MAX_IB_DEVS; d++) {
+    struct ncclIbAsyncThreadState* state = ncclIbAsyncThreads + d;
+    if (state->thread == NULL || !state->thread->joinable()) continue;
+    if (state->stopPipe[1] == -1) {
+      WARN("NET/IB: async thread for device %d has no stop pipe", d);
+      ret = ncclInternalError;
+      continue;
+    }
+    ssize_t bytes;
+    do {
+      bytes = write(state->stopPipe[1], &stop, sizeof(stop));
+    } while (bytes == -1 && errno == EINTR);
+    if (bytes == -1 && errno != EPIPE) {
+      WARN("NET/IB: could not signal async thread for device %d: %s", d, strerror(errno));
+      ret = ncclSystemError;
+    }
+  }
+  return ret;
+}
+
+static void ncclIbCloseAsyncThreadPipe(struct ncclIbAsyncThreadState* state) {
+  if (state->stopPipe[0] != -1) {
+    (void)close(state->stopPipe[0]);
+    state->stopPipe[0] = -1;
+  }
+  if (state->stopPipe[1] != -1) {
+    (void)close(state->stopPipe[1]);
+    state->stopPipe[1] = -1;
+  }
+  state->dev = NULL;
+}
+
+static ncclResult_t ncclIbJoinAsyncThreads(void) {
+  for (int d = 0; d < MAX_IB_DEVS; d++) {
+    struct ncclIbAsyncThreadState* state = ncclIbAsyncThreads + d;
+    if (state->thread != NULL) {
+      if (state->thread->joinable()) NCCLCHECK(ncclThreadJoin(*state->thread));
+      delete state->thread;
+      state->thread = NULL;
+    }
+    ncclIbCloseAsyncThreadPipe(state);
+  }
+  return ncclSuccess;
+}
+
+static ncclResult_t ncclIbCloseDeviceContexts(void) {
+  struct ibv_context* contexts[MAX_IB_DEVS];
+  int nContexts = 0;
+
+  for (int d = 0; d < ncclNIbDevs; d++) {
+    struct ibv_context* context = ncclIbDevs[d].context;
+    if (context == NULL || ncclIbContextSeen(contexts, nContexts, context)) continue;
+    contexts[nContexts++] = context;
+  }
+
+  for (int c = 0; c < nContexts; c++) {
+    NCCLCHECK(wrap_ibv_close_device(contexts[c]));
+  }
+  return ncclSuccess;
+}
+
+static void ncclIbResetDeviceState(int d) {
+  free(ncclIbDevs[d].pciPath);
+  ncclIbDevs[d].pciPath = NULL;
+  free(ncclIbDevs[d].mrCache.slots);
+  ncclIbDevs[d].mrCache.slots = NULL;
+  ncclIbDevs[d].mrCache.capacity = 0;
+  ncclIbDevs[d].mrCache.population = 0;
+  ncclIbDevs[d].context = NULL;
+  ncclIbDevs[d].pd = NULL;
+  ncclIbDevs[d].pdRefs = 0;
+  ncclIbDevs[d].devName[0] = '\0';
+  ncclIbDevs[d].fullPciPath[0] = '\0';
+  ncclIbDevs[d].device = 0;
+  ncclIbDevs[d].guid = 0;
+  ncclIbDevs[d].portNum = 0;
+  ncclIbDevs[d].link = 0;
+  ncclIbDevs[d].speed = 0;
+  ncclIbDevs[d].realPort = 0;
+  ncclIbDevs[d].maxQp = 0;
+  ncclIbDevs[d].latency = 0;
+  ncclIbDevs[d].ar = 0;
+  ncclIbDevs[d].oooRqSize = 0;
+  memset(&ncclIbDevs[d].portAttr, 0, sizeof(ncclIbDevs[d].portAttr));
+  memset(&ncclIbDevs[d].stats, 0, sizeof(ncclIbDevs[d].stats));
+  ncclIbDevs[d].dmaBufSupported = 0;
+  ncclIbDevs[d].railId = NCCL_NET_ID_UNDEF;
+  ncclIbDevs[d].planeId = NCCL_NET_ID_UNDEF;
+  ncclIbDevs[d].planeIdx = NCCL_NET_ID_UNDEF;
+  ncclIbDevs[d].ibProvider = IB_PROVIDER_NONE;
+  ncclIbDevs[d].capsProvider.mlx5.dataDirect = 0;
+}
+
+static void ncclIbResetDevices(void) {
+  for (int d = 0; d < ncclNIbDevs; d++) {
+    ncclIbResetDeviceState(d);
+  }
+  memset(ncclIbMergedDevs, 0, sizeof(ncclIbMergedDevs));
+  ncclNIbDevs = -1;
+  ncclNMergedIbDevs = -1;
+  ncclIbRelaxedOrderingEnabled = 0;
+  ncclProfilerFunction = NULL;
+  ncclIbIfName[0] = '\0';
+  memset(&ncclIbIfAddr, 0, sizeof(ncclIbIfAddr));
+  ncclGinIbGdakiResetDevices();
+}
+
+static ncclResult_t ncclIbCloseDeviceState(void) {
+  if (ncclNIbDevs <= 0) {
+    ncclIbResetDevices();
+    return ncclSuccess;
+  }
+
+  NCCLCHECK(ncclIbCheckNoDeviceResources());
+  NCCLCHECK(ncclIbSignalAsyncThreads());
+  NCCLCHECK(ncclIbJoinAsyncThreads());
+  NCCLCHECK(ncclIbCloseDeviceContexts());
+  ncclIbResetDevices();
+  return ncclSuccess;
+}
+
 ncclResult_t ncclIbFinalizeDevices(void) {
+  std::lock_guard<std::mutex> lock(ncclIbMutex);
+
+  // This releases a per-communicator plugin initialization reference. Provider discovery
+  // state is retained until ncclIbQuiesceDevices() explicitly closes it.
+  if (netRefCount <= 0) {
+    WARN("NET/IB: finalize called before init");
+    return ncclInternalError;
+  }
   netRefCount--;
+  return ncclSuccess;
+}
+
+ncclResult_t ncclIbQuiesceDevices(void) {
+  std::lock_guard<std::mutex> lock(ncclIbMutex);
+
+  if (ncclNIbDevs == -1) {
+    INFO(NCCL_INIT | NCCL_NET, "NET/IB: quiesce skipped, no discovered devices");
+    return ncclSuccess;
+  }
+  NCCLCHECK(ncclIbCloseDeviceState());
+  INFO(NCCL_INIT | NCCL_NET, "NET/IB: quiesce complete, refCount=%d", netRefCount);
   return ncclSuccess;
 }
 
@@ -429,11 +632,18 @@ static ncclResult_t ncclIbAutoAssignRailPlane(int d, const char** uniquePaths, i
 extern int64_t ncclIbArThreshold;
 ncclResult_t ncclIbInitDevices(ncclDebugLogger_t logFunction, ncclProfilerCallback_t profFunction) {
   ncclResult_t ret = ncclSuccess;
-  if (netRefCount++) return ret;
+  struct ibv_device** devices = NULL;
+  if (netRefCount++ && ncclNIbDevs != -1) return ret;
   ncclProfilerFunction = profFunction;
-  if (ncclParamIbDisable()) return ncclInternalError;
+  if (ncclParamIbDisable()) {
+    ret = ncclInternalError;
+    goto fail;
+  }
   static int shownIbHcaEnv = 0;
-  if (wrap_ibv_symbols() != ncclSuccess) return ncclInternalError;
+  if (wrap_ibv_symbols() != ncclSuccess) {
+    ret = ncclInternalError;
+    goto fail;
+  }
   if (wrap_mlx5dv_symbols() != ncclSuccess) {
     INFO(NCCL_NET, "NET/IB : Failed to open mlx5dv symbols. Advance features like CX-8 Direct-NIC will be disabled.");
   }
@@ -445,7 +655,7 @@ ncclResult_t ncclIbInitDevices(ncclDebugLogger_t logFunction, ncclProfilerCallba
       int nIpIfs = 0;
       ncclNIbDevs = 0;
       ncclNMergedIbDevs = 0;
-      NCCLCHECK(ncclFindInterfaces(ncclIbIfName, &ncclIbIfAddr, MAX_IF_NAME_SIZE, 1, &nIpIfs));
+      NCCLCHECKGOTO(ncclFindInterfaces(ncclIbIfName, &ncclIbIfAddr, MAX_IF_NAME_SIZE, 1, &nIpIfs), ret, fail);
       if (nIpIfs != 1) {
         WARN("NET/IB : No IP interface found.");
         ret = ncclInternalError;
@@ -453,8 +663,7 @@ ncclResult_t ncclIbInitDevices(ncclDebugLogger_t logFunction, ncclProfilerCallba
       }
 
       // Detect IB cards
-      int nIbDevs;
-      struct ibv_device** devices;
+      int nIbDevs = 0;
 
       // Check if user defined which IB device:port to use
       const char* userIbEnv = ncclGetEnv("NCCL_IB_HCA");
@@ -533,7 +742,8 @@ ncclResult_t ncclIbInitDevices(ncclDebugLogger_t logFunction, ncclProfilerCallba
                 TRACE(NCCL_NET, "NET/IB: Device %s does not support Data Direct DMA.", devices[d]->name);
               } else {
                 WARN("NET/IB: Error in mlx5dv_get_data_direct_sysfs_path with device %s", devices[d]->name);
-                return res;
+                ret = res;
+                goto fail;
               }
             }
           }
@@ -571,7 +781,7 @@ ncclResult_t ncclIbInitDevices(ncclDebugLogger_t logFunction, ncclProfilerCallba
                           ret, fail);
             if (dev == 1) {
               snprintf(ncclIbDevs[ncclNIbDevs].devName, MAXNAMESIZE, "%s_dma", devices[d]->name);
-              NCCLCHECK(ncclCalloc(&ncclIbDevs[ncclNIbDevs].pciPath, PATH_MAX));
+              NCCLCHECKGOTO(ncclCalloc(&ncclIbDevs[ncclNIbDevs].pciPath, PATH_MAX), ret, fail);
               strncpy(ncclIbDevs[ncclNIbDevs].pciPath, dataDirectDevicePath, PATH_MAX);
               ncclIbDevs[ncclNIbDevs].capsProvider.mlx5.dataDirect = 1;
             }
@@ -581,7 +791,7 @@ ncclResult_t ncclIbInitDevices(ncclDebugLogger_t logFunction, ncclProfilerCallba
             ncclIbDevs[ncclNIbDevs].mrCache.capacity = 0;
             ncclIbDevs[ncclNIbDevs].mrCache.population = 0;
             ncclIbDevs[ncclNIbDevs].mrCache.slots = NULL;
-            NCCLCHECK(ncclIbStatsInit(&ncclIbDevs[ncclNIbDevs].stats));
+            NCCLCHECKGOTO(ncclIbStatsInit(&ncclIbDevs[ncclNIbDevs].stats), ret, fail);
 
             ncclIbDevs[ncclNIbDevs].railId = (userIfId >= 0) ? userIfs[userIfId].rail : -1;
             ncclIbDevs[ncclNIbDevs].planeId = (userIfId >= 0) ? userIfs[userIfId].plane : -1;
@@ -600,10 +810,6 @@ ncclResult_t ncclIbInitDevices(ncclDebugLogger_t logFunction, ncclProfilerCallba
                  ncclIbDevs[ncclNIbDevs].speed, context, ncclIbDevs[ncclNIbDevs].pciPath, ncclIbDevs[ncclNIbDevs].ar,
                  ncclIbDevs[ncclNIbDevs].oooRqSize);
 
-            ncclIbAsyncThread = std::thread(ncclIbAsyncThreadMain, ncclIbDevs + ncclNIbDevs);
-            ncclSetThreadName(ncclIbAsyncThread, "NCCL IbAsync %2d", ncclNIbDevs);
-            ncclIbAsyncThread.detach();
-
             ncclNIbDevs++;
             nPorts++;
           }
@@ -614,9 +820,13 @@ ncclResult_t ncclIbInitDevices(ncclDebugLogger_t logFunction, ncclProfilerCallba
         }
       }
 
-      if (devices && (ncclSuccess != wrap_ibv_free_device_list(devices))) {
-        ret = ncclInternalError;
-        goto fail;
+      if (devices) {
+        ncclResult_t freeDevicesRet = wrap_ibv_free_device_list(devices);
+        devices = NULL;
+        if (freeDevicesRet != ncclSuccess) {
+          ret = ncclInternalError;
+          goto fail;
+        }
       }
     }
     if (ncclNIbDevs == 0) {
@@ -663,8 +873,9 @@ ncclResult_t ncclIbInitDevices(ncclDebugLogger_t logFunction, ncclProfilerCallba
       ncclNetVDeviceProps_t vProps = {0};
       vProps.ndevs = 1;
       vProps.devs[0] = d;
-      NCCLCHECK(ncclIbMakeVDeviceInternal(&vDev, &vProps));
+      NCCLCHECKGOTO(ncclIbMakeVDeviceInternal(&vDev, &vProps), ret, fail);
     }
+    NCCLCHECKGOTO(ncclIbStartAsyncThreads(), ret, fail);
     char addrline[SOCKET_NAME_MAXLEN + 1];
     INFO(NCCL_INIT | NCCL_NET, "NET/IB : Using%s %s; OOB %s:%s", line, ncclIbRelaxedOrderingEnabled ? "[RO]" : "",
          ncclIbIfName, ncclSocketToString(&ncclIbIfAddr, addrline));
@@ -672,6 +883,12 @@ ncclResult_t ncclIbInitDevices(ncclDebugLogger_t logFunction, ncclProfilerCallba
 exit:
   return ret;
 fail:
+  if (devices) (void)wrap_ibv_free_device_list(devices);
+  if (netRefCount > 0) {
+    netRefCount--;
+    ncclResult_t cleanupRet = ncclIbQuiesceDevices();
+    if (ret == ncclSuccess) ret = cleanupRet;
+  }
   goto exit;
 }
 

@@ -119,6 +119,8 @@ ncclResult_t ncclGetGinType(struct ncclComm* comm, ncclGinType_t* ginType);
 ncclResult_t ncclGetRailedGinType(struct ncclComm* comm, ncclGinType_t* ginType);
 ncclResult_t ncclGinConnectOnce(struct ncclComm* comm);
 ncclResult_t ncclGinHostFinalize(struct ncclComm* comm);
+ncclResult_t ncclGinDevCommDisconnectAll(struct ncclComm* comm);
+ncclResult_t ncclGinDevCommConnectAll(struct ncclComm* comm);
 ncclResult_t ncclGinDevCommSetup(struct ncclComm* comm, struct ncclDevCommRequirements const* reqs,
                                  struct ncclDevComm* devComm, uint32_t deviceCodeVersion);
 ncclResult_t ncclGinDevCommFree(struct ncclComm* comm, struct ncclDevComm const* devComm);

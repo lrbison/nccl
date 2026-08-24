@@ -1,6 +1,6 @@
 #pragma once
 /*
- * Included by shim.cc, shim_checkpoint.cc, and shim_auto.cc.
+ * Included by shim.cc and shim_checkpoint.cc.
  */
 
 #include <atomic>
@@ -9,9 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <map>
 #include <mutex>
-#include <utility>
 #include <vector>
 #include <dlfcn.h>
 #include <nccl.h>
@@ -20,7 +18,9 @@
 #include <unistd.h>
 
 /* Internal NCCL headers used:
- *   comm.h  — ncclComm::commHash (uint64_t) */
+ *   checks.h - NCCLCHECK/CUDACHECK helpers
+ *   comm.h   - ncclComm runtime fields
+ */
 #include "comm.h"
 #undef WARN
 #undef INFO
@@ -143,270 +143,41 @@ static inline ncclResult_t resolveRealFunction(const char* name, FnT* fn) {
   return ncclSuccess;
 }
 
-#define NCCLCHECK_WAIT(cmd, comm) \
-  do { \
-    ncclResult_t r = cmd; \
-    while (r == ncclInProgress) { \
-      usleep(10); \
-      NCCLCHECK(ncclCommGetAsyncError(comm, &r)); \
-    } \
-    NCCLCHECK(r); \
-  } while (0)
-
-enum CommCreationKind {
-  create_via_init = 1,
-  create_via_split = 2,
-  create_via_shrink = 3,
-  create_via_grow = 4,
-};
-
 enum CommUserState {
   comm_user_active = 1,
   comm_user_finalized = 2,
   comm_user_destroyed = 3,
-  comm_user_nocolor = 4,
 };
 
-struct CommInitParams {
-  CommCreationKind creation = create_via_init;
-  int nranks;
-  int rank;
-  uint64_t commHash;
-  int cudaDev;
-  ncclConfig_t config;
-  char net_name[64];
-  char comm_name[64];
-  ncclComm_t commParent = nullptr;
-  int splitColor = NCCL_SPLIT_NOCOLOR;
-  int splitKey = 0;
-  std::vector<int> shrinkExcludeRanks;
-  int shrinkFlags = NCCL_SHRINK_DEFAULT;
-  int growRankArg = -1;
-  bool growUniqueIdProvided = false;
-  bool configProvided = false;
-
-  ncclConfig_t* getConfig() {
-    return configProvided ? &config : nullptr;
-  }
-};
-
-struct NoConfig {};
-
-struct RegConfig {
-  void* base = nullptr;
-  size_t sz = 0;
+struct CommRecord {
+  ncclComm_t comm = nullptr;
   uint64_t sequence = 0;
+  uint64_t commHash = 0;
+  int nranks = -1;
+  int rank = -1;
+  int cudaDev = -1;
+  CommUserState userState = comm_user_active;
 };
 
-struct WindowConfig {
-  void* base = nullptr;
-  size_t sz = 0;
-  int flags = 0;
-  uint64_t sequence = 0;
+class CommRegistry {
+ public:
+  ncclResult_t track(ncclComm_t comm, int nranks = -1, int rank = -1, int cudaDev = -1);
+  void markState(ncclComm_t comm, CommUserState userState);
+  void remove(ncclComm_t comm);
+  void updateRuntime(const CommRecord& record);
+  std::vector<CommRecord> snapshotActive() const;
+
+ private:
+  mutable std::mutex mtx_;
+  uint64_t nextSequence_ = 1;
+  std::vector<CommRecord> comms_;
 };
+
+extern CommRegistry g_commRegistry;
 
 bool isCheckpointPrepared();
 void markCheckpointPrepared();
 void clearCheckpointPrepared();
-uint64_t nextRegistrationSequence();
-
-template <typename HandleT, typename ConfigT>
-struct HandleEntry {
-  using Handle = HandleT;
-  using Config = ConfigT;
-
-  Handle realHandle = nullptr;
-  Config* config = nullptr;
-  static constexpr const char* handleTypeString = "UNKNOWN";
-};
-
-template <typename Entry>
-class HandleMapT {
-protected:
-  using Handle = typename Entry::Handle;
-  using Config = typename Entry::Config;
-  static constexpr uintptr_t MAX_SYNTH_HANDLE_VALUE = 65535;
-  std::atomic<uintptr_t> nextSynth{1};
-
-public:
-  static constexpr const char* handleTypeString = Entry::handleTypeString;
-
-  Handle makeSynthetic(Handle realHandle, Config* config = nullptr) {
-    // Synthetic handles are allocated from a single monotonically increasing
-    // counter. That makes std::map iteration over synthetic keys match handle
-    // creation order, which the checkpoint replay path relies on.
-    uintptr_t synthValue = allocSyntheticHandleValue();
-    if (synthValue == 0) return nullptr;
-    Handle synth = reinterpret_cast<Handle>(synthValue);
-    std::lock_guard<std::mutex> lock(mtx_);
-    auto [it, inserted] = entries_.try_emplace(synth);
-    if (!inserted) return nullptr;
-    it->second.realHandle = realHandle;
-    it->second.config = config;
-    TRACE(NCCL_ALL, "makeSynthetic(%s) %p => %p", handleTypeString, synth, realHandle);
-    return synth;
-  }
-
-  void remap(Handle synthHandle, Handle newRealHandle) {
-    std::lock_guard<std::mutex> lock(mtx_);
-    Handle oldHandle = entries_[synthHandle].realHandle;
-    entries_[synthHandle].realHandle = newRealHandle;
-    TRACE(NCCL_ALL, "remap(%s) %p => %p now (was %p)", handleTypeString, synthHandle, newRealHandle, oldHandle);
-  }
-
-  /* lookup the synthHandle and return the realHandle */
-  ncclResult_t toReal(Handle synthHandle, Handle* outRealHandle) const {
-    *outRealHandle = reinterpret_cast<Handle>(synthHandle);
-    if ((uintptr_t)synthHandle > MAX_SYNTH_HANDLE_VALUE) {
-      /* handles cannot be greater than this value, it must already be the real value.*/
-      return ncclSuccess;
-    }
-    if (synthHandle == nullptr) {
-      TRACE(NCCL_ALL, "toReal(%s) resolving null pointer", handleTypeString);
-      return ncclSuccess;
-    }
-    if (isCheckpointPrepared()) {
-      return ncclInvalidArgument;
-    }
-    std::lock_guard<std::mutex> lock(mtx_);
-    auto it = entries_.find(synthHandle);
-    if (it == entries_.end()) {
-      WARN("toReal(%s): missing synthetic handle %p", handleTypeString, synthHandle);
-      return ncclInvalidArgument;
-    }
-    *outRealHandle = it->second.realHandle;
-    return ncclSuccess;
-  }
-
-  void remove(Handle synthHandle) {
-    std::lock_guard<std::mutex> lock(mtx_);
-    auto it = entries_.find(synthHandle);
-    if (it != entries_.end()) {
-      delete it->second.config;
-      entries_.erase(it);
-    }
-  }
-
-  Entry& operator[](Handle synthHandle) {
-    std::lock_guard<std::mutex> lock(mtx_);
-    return entries_[synthHandle];
-  }
-
-  ncclResult_t find(Handle synthHandle, const Entry** outEntry, Config* expectedConfig = nullptr) const {
-    *outEntry = nullptr;
-    std::lock_guard<std::mutex> lock(mtx_);
-    auto it = entries_.find(synthHandle);
-    if (it == entries_.end()) {
-      WARN("find(%s): missing handle %p", handleTypeString, synthHandle);
-      return ncclInternalError;
-    }
-    if (expectedConfig != nullptr && it->second.config != expectedConfig) {
-      WARN("find(%s): handle %p config mismatch: expected %p, found %p", handleTypeString, synthHandle, expectedConfig,
-           it->second.config);
-      return ncclInternalError;
-    }
-    *outEntry = &it->second;
-    return ncclSuccess;
-  }
-
-  ncclResult_t find(Handle synthHandle, Entry** outEntry, Config* expectedConfig = nullptr) {
-    *outEntry = nullptr;
-    std::lock_guard<std::mutex> lock(mtx_);
-    auto it = entries_.find(synthHandle);
-    if (it == entries_.end()) {
-      WARN("find(%s): missing handle %p", handleTypeString, synthHandle);
-      return ncclInternalError;
-    }
-    if (expectedConfig != nullptr && it->second.config != expectedConfig) {
-      WARN("find(%s): handle %p config mismatch: expected %p, found %p", handleTypeString, synthHandle, expectedConfig,
-           it->second.config);
-      return ncclInternalError;
-    }
-    *outEntry = &it->second;
-    return ncclSuccess;
-  }
-
-  bool checkHandle(Handle synthHandle) const {
-    std::lock_guard<std::mutex> lock(mtx_);
-    return entries_.find(synthHandle) != entries_.end();
-  }
-
-  template <typename Fn>
-  ncclResult_t forEachHandle(Fn&& fn) const {
-    std::vector<std::pair<Handle, const Entry*>> work;
-    {
-      std::lock_guard<std::mutex> lock(mtx_);
-      for (const auto& [synth, entry] : entries_) {
-        if (entry.config != nullptr) work.emplace_back(synth, &entry);
-      }
-    }
-    for (const auto& [synth, entry] : work) {
-      ncclResult_t ret = fn(synth, entry);
-      if (ret != ncclSuccess) return ret;
-    }
-    return ncclSuccess;
-  }
-
-  uintptr_t peekNextHandle() {
-    /* query without modifying */
-    return nextSynth;
-  }
-
-protected:
-  uintptr_t allocSyntheticHandleValue() {
-    if (nextSynth > MAX_SYNTH_HANDLE_VALUE) return 0;
-    return nextSynth++;
-  }
-
-  mutable std::mutex mtx_;
-  std::map<Handle, Entry> entries_;
-};
-
-struct RegHandleEntry : public HandleEntry<void*, RegConfig> {
-  static constexpr const char* handleTypeString = "ncclMR";
-  ncclComm_t synthComm = nullptr;
-};
-using RegHandleMap = HandleMapT<RegHandleEntry>;
-
-struct WindowHandleEntry : public HandleEntry<ncclWindow_t, WindowConfig> {
-  static constexpr const char* handleTypeString = "ncclWindow_t";
-  ncclComm_t synthComm = nullptr;
-};
-using WindowHandleMap = HandleMapT<WindowHandleEntry>;
-
-struct CommHandleEntry : public HandleEntry<ncclComm_t, CommInitParams> {
-  static constexpr const char* handleTypeString = "ncclComm_t";
-  int liveChildCommCount = 0;
-  CommUserState userState = comm_user_active;
-  bool restoreUnsafe = false;
-  const char* restoreUnsafeReason = nullptr;
-  std::map<uint64_t, void*> registrations;
-  std::map<uint64_t, ncclWindow_t> windows;
-};
-
-using CommHandleMap = HandleMapT<CommHandleEntry>;
-
-extern CommHandleMap g_commHandles;
-extern RegHandleMap g_regHandles;
-extern WindowHandleMap g_windowHandles;
-
-static inline void markCommRestoreUnsafe(ncclComm_t synthComm, const char* reason) {
-  if (!g_commHandles.checkHandle(synthComm)) return;
-
-  CommHandleEntry& entry = g_commHandles[synthComm];
-  if (!entry.restoreUnsafe) {
-    entry.restoreUnsafe = true;
-    entry.restoreUnsafeReason = reason;
-    WARN("communicator %p is not checkpoint-restore safe: %s", synthComm, reason);
-  }
-}
-
-static inline void markWindowCommRestoreUnsafe(ncclWindow_t synthWin, const char* reason) {
-  if (!g_windowHandles.checkHandle(synthWin)) return;
-
-  WindowHandleEntry& entry = g_windowHandles[synthWin];
-  markCommRestoreUnsafe(entry.synthComm, reason);
-}
 
 }  // namespace nccl_checkpoint
 

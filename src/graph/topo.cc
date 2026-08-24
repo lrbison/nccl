@@ -2108,6 +2108,18 @@ ncclResult_t ncclTopoGetSystem(struct ncclComm* comm, struct ncclTopoSystem** sy
     NCCLCHECKGOTO(ncclTopoFuseXml(xml, peerXml), ret, fail);
   }
 
+  if (system != NULL && comm != NULL) {
+    char* packedXml = NULL;
+    free(comm->joinInitData.topoXml);
+    comm->joinInitData.topoXml = NULL;
+    comm->joinInitData.topoXmlMaxNodes = xml->maxNodes;
+    comm->joinInitData.topoXmlSize = xmlMemSize(xml->maxNodes);
+    NCCLCHECKGOTO(ncclCalloc(&packedXml, comm->joinInitData.topoXmlSize), ret, fail);
+    memcpy(packedXml, xml, comm->joinInitData.topoXmlSize);
+    NCCLCHECKGOTO(ncclTopoConvertXml((struct ncclXml*)packedXml, (uintptr_t)xml->nodes, 1), ret, fail);
+    comm->joinInitData.topoXml = packedXml;
+  }
+
   if (dumpXmlFile && comm->rank == ncclParamTopoDumpFileRank()) {
     INFO(NCCL_ENV, "NCCL_TOPO_DUMP_FILE set by environment to %s", dumpXmlFile);
     NCCLCHECKGOTO(ncclTopoDumpXmlToFile(dumpXmlFile, xml), ret, fail);
@@ -2332,12 +2344,13 @@ ncclResult_t ncclTopoGetLocalGinDev(struct ncclTopoSystem* system, int rank, int
 }
 
 ncclResult_t ncclTopoGetLocalGinDevs(struct ncclComm* comm, int* localGinDevs, int* localGinCount) {
+  *localGinCount = 0;
   for (int c = 0; c < NCCL_TOPO_MAX_NODES; c++) {
     NCCLCHECK(ncclTopoGetLocalGinDev(comm->topo, comm->rank, c, NULL, localGinDevs + c));
     if (c > 0 && localGinDevs[c] == localGinDevs[0]) {
-      *localGinCount = c;
       break;
     }
+    *localGinCount = c + 1;
   }
   return ncclSuccess;
 }
@@ -2347,12 +2360,13 @@ ncclResult_t ncclTopoGetLocalRmaDev(struct ncclTopoSystem* system, int rank, int
 }
 
 ncclResult_t ncclTopoGetLocalRmaDevs(struct ncclComm* comm, int* localRmaDevs, int* localRmaCount) {
+  *localRmaCount = 0;
   for (int c = 0; c < NCCL_TOPO_MAX_NODES; c++) {
     NCCLCHECK(ncclTopoGetLocalRmaDev(comm->topo, comm->rank, c, NULL, localRmaDevs + c));
     if (c > 0 && localRmaDevs[c] == localRmaDevs[0]) {
-      *localRmaCount = c;
       break;
     }
+    *localRmaCount = c + 1;
   }
   return ncclSuccess;
 }

@@ -60,6 +60,17 @@ fail:
   return ret;
 }
 
+ncclResult_t ncclNetSocketResetDevices() {
+  std::lock_guard<std::mutex> lock(ncclNetSocketDevicesMutex);
+  for (int i = 0; i < ncclNetIfs; i++) {
+    free(ncclNetSocketDevs[i].pciPath);
+    ncclNetSocketDevs[i].pciPath = NULL;
+  }
+  memset(ncclNetSocketDevs, 0, sizeof(ncclNetSocketDevs));
+  ncclNetIfs = -1;
+  return ncclSuccess;
+}
+
 ncclResult_t ncclNetSocketGetSpeed(char* devName, int* speed) {
   ncclResult_t ret = ncclSuccess;
   *speed = 0;

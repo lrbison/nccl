@@ -7,6 +7,8 @@
 
 #include "dev_runtime.h"
 #include "comm.h"
+#include <cstddef>
+#include <cstring>
 
 typedef struct ncclResourceWindow_vidmem_v23000 {
   char reserved1[8];
@@ -154,7 +156,10 @@ static ncclResult_t ncclDevCommCopyNewToOld_v23000(ncclComm_t comm, void* oldDev
 static ncclResult_t ncclDevCommCopyOldToNew_v23000(ncclComm_t comm, struct ncclDevComm* newDevComm,
                                                    void const* oldDevComm) {
   struct ncclDevComm_v23000 const* old = (struct ncclDevComm_v23000 const*)oldDevComm;
+  ncclTeam_t ucTeam = ncclTeamCft(comm);
+  ncclTeam_t mcTeam = ncclTeamCftMultimem(comm);
 
+  memset(newDevComm, '\0', sizeof(*newDevComm));
   newDevComm->magic = old->magic;
   newDevComm->version = old->version;
   newDevComm->rank = old->rank;
@@ -178,6 +183,7 @@ static ncclResult_t ncclDevCommCopyOldToNew_v23000(ncclComm_t comm, struct ncclD
   newDevComm->ginSignalShadows = old->ginSignalShadows;
   newDevComm->ginContextCount = old->ginContextCount;
   newDevComm->ginConnectionStride = old->ginConnectionsRailed ? old->lsaSize : 1;
+  newDevComm->ginConnectionStride_rcp32 = idivRcp32(newDevComm->ginConnectionStride);
   newDevComm->ginContextStride = old->ginContextsRailed ? old->lsaSize : 1;
   newDevComm->ginStrongLegacySignals = old->ginStrongLegacySignals;
 
@@ -185,7 +191,14 @@ static ncclResult_t ncclDevCommCopyOldToNew_v23000(ncclComm_t comm, struct ncclD
   newDevComm->hybridLsaBarrier = old->hybridLsaBarrier;
   newDevComm->hybridRailGinBarrier = old->hybridRailGinBarrier;
   newDevComm->worldGinBarrier = old->worldGinBarrier;
-
+  newDevComm->cftRank = ucTeam.rank;
+  newDevComm->cftSize = ucTeam.nRanks;
+  newDevComm->cftMultimemRank = mcTeam.rank;
+  newDevComm->cftMultimemSize = mcTeam.nRanks;
+  newDevComm->cftMultimemSize_rcp32 = idivRcp32(mcTeam.nRanks);
+  newDevComm->ucLeId = NCCL_LE_ID_INVALID;
+  newDevComm->mcLeId = NCCL_LE_ID_INVALID;
+  newDevComm->dynamicState = nullptr;
   return ncclSuccess;
 }
 

@@ -11,6 +11,7 @@
 #include "graph.h"
 #include "transport.h"
 #include "register_inline.h"
+#include "alloc.h"
 #include "gin/gin_host.h"
 #include "gin/gin_host_proxy.h"
 #include "compiler.h"
@@ -68,9 +69,13 @@ void* ncclGinProgress(struct ncclGinState* ginState, int threadIdx) {
       std::shared_lock<std::shared_timed_mutex> rlock(ginState->devCommRwMutex);
       struct ncclGinStateDevComm* dc = ginState->devComms;
       while (dc) {
+        if (!dc->connected) {
+          dc = dc->next;
+          continue;
+        }
         struct ncclGinBackendState* backend = &ginState->backends[dc->backendIndex];
-        for (int commIdx = threadIdx; commIdx < backend->ginCommCount; commIdx += ginState->proxyNthreads) {
-          if (dc->devHandles[commIdx]->needsProxyProgress) {
+        for (int commIdx = threadIdx; commIdx < dc->connectionCount; commIdx += ginState->proxyNthreads) {
+          if (dc->devHandles[commIdx] != NULL && dc->devHandles[commIdx]->needsProxyProgress) {
             ncclResult_t ret = backend->ncclGin->ginProgress(dc->ginCtx[commIdx]);
             if (ret != ncclSuccess) {
               COMPILER_ATOMIC_STORE(&ginState->asyncResult, ret, std::memory_order_release);
@@ -88,6 +93,7 @@ void* ncclGinProgress(struct ncclGinState* ginState, int threadIdx) {
 
 NCCL_PARAM(GinNconnections, "GIN_NCONNECTIONS", -2);
 NCCL_PARAM(GinProxyNthreads, "GIN_PROXY_NTHREADS", 1);
+extern int64_t ncclParamDevApiJit();
 
 ncclResult_t ncclGinConnectOnce(struct ncclComm* comm) {
   ncclTeam_t ginTeam;
@@ -116,6 +122,10 @@ ncclResult_t ncclGinConnectOnce(struct ncclComm* comm) {
   int nLocalGinDevs;
   int localGinDevs[NCCL_TOPO_MAX_NODES];
   NCCLCHECK(ncclTopoGetLocalGinDevs(comm, localGinDevs, &nLocalGinDevs));
+  if (nLocalGinDevs <= 0) {
+    WARN("No local GIN-capable devices found.");
+    return ncclInvalidUsage;
+  }
   if (nLocalGinDevs > NCCL_GIN_MAX_CONNECTIONS) {
     INFO(NCCL_NET | NCCL_INIT | NCCL_GRAPH,
          "WARNING. Found %d local devices, but GIN supports at most %d connections. Using the first %d connections.",
@@ -160,6 +170,10 @@ ncclResult_t ncclGinConnectOnce(struct ncclComm* comm) {
     }
 
     backend->ginCommCount = nLocalGinDevs;
+    if (backend->ginVersion < 13) {
+      // We only support one context per connection, so create as many connections as possible.
+      backend->ginCommCount = NCCL_GIN_MAX_CONNECTIONS;
+    }
 
     // Resolve the number of GIN progress threads. Default 1; Max NCCL_GIN_MAX_CONNECTIONS.
     ginState->proxyNthreads = 1;
@@ -178,6 +192,11 @@ ncclResult_t ncclGinConnectOnce(struct ncclComm* comm) {
     NCCLCHECKGOTO(bootstrapAllGather(comm->bootstrap, ginCommCountHandles, sizeof(int)), ret, fail);
     for (int r = 0; r < comm->nRanks; r++) {
       backend->ginCommCount = std::min(backend->ginCommCount, ginCommCountHandles[r]);
+    }
+    if (backend->ginCommCount <= 0) {
+      WARN("No GIN connections available across communicator.");
+      ret = ncclInvalidUsage;
+      goto fail;
     }
     // After cross-rank min, proxyNthreads may exceed ginCommCount if ranks disagree
     // on NCCL_GIN_PROXY_NTHREADS (atypical — env vars are normally uniform across a job).
@@ -243,39 +262,11 @@ ncclResult_t ncclGinValidateSignalRequest(struct ncclDevCommRequirements const* 
   return ncclSuccess;
 }
 
-static ncclResult_t ginDevCommSetupWithBackend(struct ncclComm* comm, struct ncclDevCommRequirements const* reqs,
-                                               struct ncclDevComm* devComm, uint32_t deviceCodeVersion,
-                                               struct ncclGinBackendState* backend) {
-  ncclGinConfig_t ginConfig;
-  struct ncclGinState* ginState = &comm->sharedRes->ginState;
-
-  devComm->backendIndex = (uint8_t)(backend - ginState->backends);
-  devComm->ginSignalCount = reqs->ginSignalCount;
-  devComm->ginCounterCount = reqs->ginCounterCount;
-  // Legacy signals default to what is specified in DevCommRequirements
-  devComm->ginStrongLegacySignals = reqs->ginStrongSignalsRequired;
-
-  // Allocate contexts
-  int nContextsTotal = reqs->ginContextCount;
-  devComm->ginConnectionCount = backend->ginCommCount;
-  if (!reqs->ginExclusiveContexts) {
-    // TODO: check if a shared devComm in the list could match our requirements.
-  }
-
-  nContextsTotal = ROUNDUP(nContextsTotal, backend->ginCommCount);
-  devComm->ginContextCount = nContextsTotal;
-  int nContextsPerComm = nContextsTotal / backend->ginCommCount;
-  INFO(NCCL_INIT,
-       "devCommCreate: creating %d contexts: %d GIN connections with %d contexts each (%d contexts total requested)",
-       nContextsTotal, backend->ginCommCount, nContextsPerComm, reqs->ginContextCount);
-
-  struct ncclGinStateDevComm* ginStateDevComm = NULL;
-  NCCLCHECK(ncclCalloc(&ginStateDevComm, 1));
-  ginStateDevComm->contextCount = nContextsTotal;
-  ginStateDevComm->backendIndex = (int)(backend - ginState->backends);
-
+static ncclResult_t ncclGinGetBackendVersion(uint32_t deviceCodeVersion, struct ncclGinBackendState* backend,
+                                             int* backendVersion) {
   const int* backendVersionArray;
   int nVersions;
+
   switch (backend->ginType) {
   case NCCL_GIN_TYPE_PROXY:
     backendVersionArray = proxyBackendMinVersions;
@@ -298,18 +289,164 @@ static ncclResult_t ginDevCommSetupWithBackend(struct ncclComm* comm, struct ncc
     return ncclInternalError;
   }
 
-  int backendVersion = 0;
-  for (int i = 0; i < nVersions; i++) {
-    if (deviceCodeVersion < backendVersionArray[i]) break;
-    backendVersion = i;
+  *backendVersion = 0;
+  if (ncclParamDevApiJit() == 1) {
+    // JIT: device code version is the latest version.
+    *backendVersion = nVersions - 1;
+  } else {
+    // Non-JIT: device code version matches the version passed by the caller.
+    for (int i = 0; i < nVersions; i++) {
+      if (deviceCodeVersion >= (uint32_t)backendVersionArray[i]) *backendVersion = i;
+      else break;
+    }
   }
+  return ncclSuccess;
+}
 
+static ncclResult_t ncclGinDevCommAppend(struct ncclGinState* ginState, struct ncclGinStateDevComm* ginStateDevComm) {
+  bool locked = ginState->proxyThreadsCreated;
+  if (locked) ginProgressWriteLock(ginState);
+  struct ncclGinStateDevComm* last = ginState->devComms;
+  if (last) {
+    while (last->next) last = last->next;
+    last->next = ginStateDevComm;
+  } else {
+    ginState->devComms = ginStateDevComm;
+  }
+  if (locked) ginProgressWriteUnlock(ginState);
+  return ncclSuccess;
+}
+
+static ncclResult_t ncclGinDevCommStoreDynamic(struct ncclGinStateDevComm* ginStateDevComm,
+                                               struct ncclDevComm* devComm) {
+  ncclDevCommDynamic_t dynamicState = {};
+  dynamicState.ginConnectionCount = ginStateDevComm->connectionCount;
+  for (int n = 0; n < ginStateDevComm->connectionCount; n++) {
+    dynamicState.ginNetDeviceTypes[n] = ginStateDevComm->devHandles[n]->netDeviceType;
+    dynamicState.ginHandles[n] = ginStateDevComm->devHandles[n]->handle;
+    if (devComm != NULL) {
+      devComm->ginNetDeviceTypes[n] = dynamicState.ginNetDeviceTypes[n];
+      devComm->ginHandles[n] = dynamicState.ginHandles[n];
+    }
+  }
+  if (devComm != NULL) devComm->ginConnectionCount = ginStateDevComm->connectionCount;
+  NCCLCHECK(ncclCudaMemcpy(ginStateDevComm->dynamicState, &dynamicState, 1));
+  return ncclSuccess;
+}
+
+static ncclResult_t ncclGinStartProgressThreads(struct ncclComm* comm) {
+  struct ncclGinState* ginState = &comm->sharedRes->ginState;
+  if (ginState->proxyThreadsCreated) return ncclSuccess;
+
+  ginState->cpuAffinity = comm->cpuAffinity;
+  ginState->proxyThreadStopSignal.store(false);
+  ginState->proxyThreadsCreated = true;
+  for (int t = 0; t < ginState->proxyNthreads; t++) {
+    ginState->thread[t] = std::thread([ginState, t] { ncclGinProgress(ginState, t); });
+    ncclSetThreadName(ginState->thread[t], "NCCL GIN P%d-%d", comm->cudaDev, t);
+  }
+  return ncclSuccess;
+}
+
+static ncclResult_t ncclGinStopProgressThreads(struct ncclGinState* ginState) {
+  if (!ginState->proxyThreadsCreated) return ncclSuccess;
+
+  ginState->proxyThreadStopSignal.store(true);
+  for (int t = 0; t < ginState->proxyNthreads; t++) {
+    if (ginState->thread[t].joinable()) ginState->thread[t].join();
+  }
+  ginState->proxyThreadsCreated = false;
+  ginState->proxyThreadStopSignal.store(false);
+  return ncclSuccess;
+}
+
+static ncclResult_t ncclGinDevCommCreateContexts(struct ncclComm* comm, struct ncclGinStateDevComm* ginStateDevComm,
+                                                 struct ncclDevComm* devComm) {
+  struct ncclGinState* ginState = &comm->sharedRes->ginState;
+  struct ncclGinBackendState* backend = &ginState->backends[ginStateDevComm->backendIndex];
   ncclResult_t ret = ncclSuccess;
   bool needsProxyProgress = false;
+  int nContextsTotal = ginStateDevComm->devContextCount;
 
-  int connectedStride =
-    comm->sharedRes->ginState.ginConnectionType == NCCL_GIN_CONNECTION_FULL ? 1 : comm->contiguousRanksPerHost;
+  if (!ginState->connected || backend->ginCommCount <= 0) return ncclInternalError;
+  if (ginStateDevComm->backendVersion < 13) {
+    if (ginStateDevComm->deferred) {
+      WARN("Deferred GIN devComm setup requires a GIN plugin with backend version 13 or newer.");
+      return ncclInvalidUsage;
+    }
+    nContextsTotal = backend->ginCommCount;
+  }
+  if (devComm != NULL) {
+    devComm->ginContextCount =
+      ginStateDevComm->backendVersion < 13 ? backend->ginCommCount : ginStateDevComm->devContextCount;
+  }
+
+  nContextsTotal = ROUNDUP(nContextsTotal, backend->ginCommCount);
+  ginStateDevComm->contextCount = nContextsTotal;
+  ginStateDevComm->connectionCount = backend->ginCommCount;
+  int nContextsPerComm = nContextsTotal / backend->ginCommCount;
+  INFO(NCCL_INIT,
+       "devCommCreate: creating %d contexts: %d GIN connections with %d contexts each (%d contexts total requested)",
+       nContextsTotal, backend->ginCommCount, nContextsPerComm, ginStateDevComm->devContextCount);
+
+  ncclGinConfig_t ginConfig = {
+    ginStateDevComm->ginSignalCount, ginStateDevComm->ginCounterCount, nContextsPerComm,
+    ginStateDevComm->ginQueueDepth,  ginStateDevComm->ginTrafficClass, ginStateDevComm->backendVersion,
+    ginStateDevComm->rankStride,
+  };
+
+  for (int n = 0; n < backend->ginCommCount; n++) {
+    NCCLCHECKGOTO(backend->ncclGin->createContext(backend->ginComms[n], &ginConfig, &ginStateDevComm->ginCtx[n],
+                                                  &ginStateDevComm->devHandles[n]),
+                  ret, fail);
+    if (ginStateDevComm->ginCtx[n] == NULL || ginStateDevComm->devHandles[n] == NULL ||
+        ginStateDevComm->devHandles[n]->handle == NULL) {
+      WARN("GIN plugin %s returned invalid context for connection %d: ginCtx=%p devHandle=%p handle=%p",
+           backend->ncclGin->name, n, ginStateDevComm->ginCtx[n], ginStateDevComm->devHandles[n],
+           ginStateDevComm->devHandles[n] ? ginStateDevComm->devHandles[n]->handle : NULL);
+      ret = ncclInternalError;
+      goto fail;
+    }
+    if (ginStateDevComm->devHandles[n]->needsProxyProgress) needsProxyProgress = true;
+  }
+
+  ginStateDevComm->connected = true;
+  NCCLCHECKGOTO(ncclGinDevCommStoreDynamic(ginStateDevComm, devComm), ret, fail);
+  if (needsProxyProgress) NCCLCHECKGOTO(ncclGinStartProgressThreads(comm), ret, fail);
+  return ncclSuccess;
+
+fail:
+  for (int n = 0; n < NCCL_GIN_MAX_CONNECTIONS; n++) {
+    if (ginStateDevComm->ginCtx[n]) {
+      backend->ncclGin->destroyContext(ginStateDevComm->ginCtx[n]);
+      ginStateDevComm->ginCtx[n] = NULL;
+      ginStateDevComm->devHandles[n] = NULL;
+    }
+  }
+  ginStateDevComm->connected = false;
+  return ret;
+}
+
+static ncclResult_t ginDevCommSetupWithBackend(struct ncclComm* comm, struct ncclDevCommRequirements const* reqs,
+                                               struct ncclDevComm* devComm, uint32_t deviceCodeVersion,
+                                               struct ncclGinBackendState* backend) {
+  struct ncclGinState* ginState = &comm->sharedRes->ginState;
+  struct ncclGinStateDevComm* ginStateDevComm = NULL;
+  ncclDevCommDynamic_t dynamicState = {};
+  ncclResult_t ret = ncclSuccess;
+  int connectedStride = comm->globalGinSupport == NCCL_GIN_CONNECTION_FULL ? 1 : comm->contiguousRanksPerHost;
   int requestedStride = 1;
+
+  devComm->backendIndex = (uint8_t)(backend - ginState->backends);
+  devComm->ginSignalCount = reqs->ginSignalCount;
+  devComm->ginCounterCount = reqs->ginCounterCount;
+  // Legacy signals default to what is specified in DevCommRequirements
+  devComm->ginStrongLegacySignals = reqs->ginStrongSignalsRequired;
+
+  if (!reqs->ginExclusiveContexts) {
+    // TODO: check if a shared devComm in the list could match our requirements.
+  }
+
   if (reqs->ginConnectionType == NCCL_GIN_CONNECTION_CUSTOM_STRIDE) {
     requestedStride = reqs->ginCustomStride;
   } else if (reqs->ginConnectionType == NCCL_GIN_CONNECTION_RAIL) {
@@ -337,67 +474,39 @@ static ncclResult_t ginDevCommSetupWithBackend(struct ncclComm* comm, struct ncc
     goto end;
   }
 
+  NCCLCHECKGOTO(ncclCalloc(&ginStateDevComm, 1), ret, end);
+  NCCLCHECKGOTO(ncclGinGetBackendVersion(deviceCodeVersion, backend, &ginStateDevComm->backendVersion), ret, end);
+
+  ginStateDevComm->backendIndex = (int)(backend - ginState->backends);
+  ginStateDevComm->devContextCount = reqs->ginContextCount;
+  ginStateDevComm->ginSignalCount = reqs->ginSignalCount;
+  ginStateDevComm->ginCounterCount = reqs->ginCounterCount;
+  ginStateDevComm->ginQueueDepth = reqs->ginQueueDepth;
+  ginStateDevComm->ginTrafficClass =
+    reqs->ginTrafficClass != NCCL_CONFIG_UNDEF_INT ? reqs->ginTrafficClass : comm->config.trafficClass;
+  ginStateDevComm->rankStride = requestedStride / connectedStride;
+  ginStateDevComm->deferred = comm->joinDeferred;
+
   devComm->ginConnectionStride = connectedStride;
   devComm->ginConnectionStride_rcp32 = idivRcp32(connectedStride);
   devComm->ginContextStride = requestedStride;
-  ginConfig = {
-    reqs->ginSignalCount,
-    reqs->ginCounterCount,
-    nContextsPerComm,
-    reqs->ginQueueDepth,
-    reqs->ginTrafficClass != NCCL_CONFIG_UNDEF_INT ? reqs->ginTrafficClass : comm->config.trafficClass,
-    backendVersion,
-    /*rankStride*/ requestedStride / connectedStride,
-  };
+  devComm->ginContextCount = ginStateDevComm->backendVersion < 13 && ginState->connected ?
+                               backend->ginCommCount :
+                               ginStateDevComm->devContextCount;
+  devComm->ginConnectionCount = ginState->connected ? backend->ginCommCount : 1;
+  dynamicState.ginConnectionCount = devComm->ginConnectionCount;
+  NCCLCHECKGOTO(ncclCudaCalloc(&devComm->dynamicState, 1, comm->memManager), ret, end);
+  NCCLCHECKGOTO(ncclCudaMemcpy(devComm->dynamicState, &dynamicState, 1), ret, end);
+  ginStateDevComm->dynamicState = devComm->dynamicState;
 
-  for (int commIdx = 0; commIdx < backend->ginCommCount; commIdx++) {
-    NCCLCHECKGOTO(backend->ncclGin->createContext(backend->ginComms[commIdx], &ginConfig,
-                                                  &ginStateDevComm->ginCtx[commIdx],
-                                                  &ginStateDevComm->devHandles[commIdx]),
-                  ret, end);
-    if (ginStateDevComm->ginCtx[commIdx] == NULL || ginStateDevComm->devHandles[commIdx] == NULL ||
-        ginStateDevComm->devHandles[commIdx]->handle == NULL) {
-      WARN("GIN plugin %s returned invalid context for connection %d: ginCtx=%p devHandle=%p handle=%p",
-           backend->ncclGin->name, commIdx, ginStateDevComm->ginCtx[commIdx], ginStateDevComm->devHandles[commIdx],
-           ginStateDevComm->devHandles[commIdx] ? ginStateDevComm->devHandles[commIdx]->handle : NULL);
-      ret = ncclInternalError;
-      goto end;
-    }
-    devComm->ginNetDeviceTypes[commIdx] = ginStateDevComm->devHandles[commIdx]->netDeviceType;
-    devComm->ginHandles[commIdx] = ginStateDevComm->devHandles[commIdx]->handle;
-    if (ginStateDevComm->devHandles[commIdx]->needsProxyProgress) needsProxyProgress = true;
+  if (ginState->connected) {
+    NCCLCHECKGOTO(ncclGinDevCommCreateContexts(comm, ginStateDevComm, devComm), ret, end);
   }
-
-  // Add devComm and (re)start progress threads as needed.
-  {
-    bool needsStart = needsProxyProgress && !ginState->proxyThreadsCreated;
-
-    if (ginState->proxyThreadsCreated) ginProgressWriteLock(ginState);
-    struct ncclGinStateDevComm* last = ginState->devComms;
-    if (last) {
-      while (last->next) last = last->next;
-      last->next = ginStateDevComm;
-    } else {
-      ginState->devComms = ginStateDevComm;
-    }
-    if (ginState->proxyThreadsCreated) ginProgressWriteUnlock(ginState);
-
-    if (needsStart) {
-      ginState->cpuAffinity = comm->cpuAffinity;
-      ginState->proxyThreadsCreated = true;
-      for (int t = 0; t < ginState->proxyNthreads; t++) {
-        ginState->thread[t] = std::thread([ginState, t] { ncclGinProgress(ginState, t); });
-        ncclSetThreadName(ginState->thread[t], "NCCL GIN P%d-%d", comm->cudaDev, t);
-      }
-    }
-  }
+  NCCLCHECKGOTO(ncclGinDevCommAppend(ginState, ginStateDevComm), ret, end);
+  ginStateDevComm = NULL;
 
 end:
   if (ret != ncclSuccess) {
-    for (int commIdx = 0; commIdx < backend->ginCommCount; commIdx++) {
-      if (ginStateDevComm->ginCtx[commIdx]) backend->ncclGin->destroyContext(ginStateDevComm->ginCtx[commIdx]);
-    }
-    free(ginStateDevComm);
     devComm->backendIndex = 0;
     devComm->ginConnectionCount = 0;
     devComm->ginContextCount = 0;
@@ -406,6 +515,16 @@ end:
     devComm->ginContextStride = 0;
     memset(devComm->ginNetDeviceTypes, 0, sizeof(devComm->ginNetDeviceTypes));
     memset(devComm->ginHandles, 0, sizeof(devComm->ginHandles));
+    if (ginStateDevComm != NULL) {
+      for (int n = 0; n < NCCL_GIN_MAX_CONNECTIONS; n++) {
+        if (ginStateDevComm->ginCtx[n]) backend->ncclGin->destroyContext(ginStateDevComm->ginCtx[n]);
+      }
+      free(ginStateDevComm);
+    }
+    if (devComm->dynamicState) {
+      NCCLCHECKIGNORE(ncclCudaFree(devComm->dynamicState, comm->memManager), ret);
+      devComm->dynamicState = NULL;
+    }
   }
   return ret;
 }
@@ -446,34 +565,89 @@ ncclResult_t ncclGinDevCommSetup(struct ncclComm* comm, struct ncclDevCommRequir
   return ncclInternalError;
 }
 
-// Called from main thread.
+ncclResult_t ncclGinDevCommDisconnectAll(struct ncclComm* comm) {
+  ncclResult_t ret = ncclSuccess;
+  struct ncclGinState* ginState = &comm->sharedRes->ginState;
+
+  NCCLCHECK(ncclGinStopProgressThreads(ginState));
+
+  for (struct ncclGinStateDevComm* dc = ginState->devComms; dc != NULL; dc = dc->next) {
+    if (!dc->connected) continue;
+    struct ncclGinBackendState* backend = &ginState->backends[dc->backendIndex];
+    for (int n = 0; n < NCCL_GIN_MAX_CONNECTIONS; n++) {
+      if (dc->ginCtx[n] != NULL) {
+        NCCLCHECKGOTO(backend->ncclGin->destroyContext(dc->ginCtx[n]), ret, exit);
+        dc->ginCtx[n] = NULL;
+        dc->devHandles[n] = NULL;
+      }
+    }
+    dc->connected = false;
+    dc->connectionCount = 0;
+  }
+
+  for (int backendIdx = 0; backendIdx < ginState->numActiveBackends; backendIdx++) {
+    struct ncclGinBackendState* backend = &ginState->backends[backendIdx];
+    for (int n = 0; n < NCCL_GIN_MAX_CONNECTIONS; n++) {
+      if (backend->ginComms[n] != NULL) {
+        NCCLCHECKGOTO(backend->ncclGin->closeColl(backend->ginComms[n]), ret, exit);
+        backend->ginComms[n] = NULL;
+      }
+    }
+    backend->ginCommCount = 0;
+  }
+  ginState->connected = false;
+
+exit:
+  return ret;
+}
+
+ncclResult_t ncclGinDevCommConnectAll(struct ncclComm* comm) {
+  ncclResult_t ret = ncclSuccess;
+  struct ncclGinState* ginState = &comm->sharedRes->ginState;
+
+  if (ginState->devComms == NULL) return ncclSuccess;
+  NCCLCHECKGOTO(ncclGinConnectOnce(comm), ret, exit);
+  for (struct ncclGinStateDevComm* dc = ginState->devComms; dc != NULL; dc = dc->next) {
+    if (dc->connected) continue;
+    NCCLCHECKGOTO(ncclGinDevCommCreateContexts(comm, dc, NULL), ret, exit);
+  }
+
+exit:
+  return ret;
+}
+
 ncclResult_t ncclGinDevCommFree(struct ncclComm* comm, struct ncclDevComm const* devComm) {
   // Find the resource associated with this devComm. Use the gin handle as key.
   struct ncclGinState* ginState = &comm->sharedRes->ginState;
 
   struct ncclGinStateDevComm *dc = ginState->devComms, *prevDc = NULL;
+  bool locked = ginState->proxyThreadsCreated;
+  if (locked) ginProgressWriteLock(ginState);
   while (1) {
     if (dc == NULL) {
+      if (locked) ginProgressWriteUnlock(ginState);
       WARN("Dev comm not found\n");
       return ncclInternalError;
     }
-    if (dc->devHandles[0]->handle == devComm->ginHandles[0]) break;
+    if ((devComm->dynamicState != NULL && dc->dynamicState == devComm->dynamicState) ||
+        (dc->devHandles[0] != NULL && dc->devHandles[0]->handle == devComm->ginHandles[0]))
+      break;
     prevDc = dc;
     dc = dc->next;
   }
 
-  ginProgressWriteLock(ginState);
   // Remove from linked list
   if (prevDc) prevDc->next = dc->next;
   else ginState->devComms = dc->next;
-  ginProgressWriteUnlock(ginState);
+  if (locked) ginProgressWriteUnlock(ginState);
 
   struct ncclGinBackendState* backend = &ginState->backends[dc->backendIndex];
   // The devComm is now unreachable by any progress thread; safe to destroy
   // its contexts while the workers keep progressing the rest of the list.
-  for (int commIdx = 0; commIdx < backend->ginCommCount; commIdx++) {
-    NCCLCHECK(backend->ncclGin->destroyContext(dc->ginCtx[commIdx]));
+  for (int n = 0; n < NCCL_GIN_MAX_CONNECTIONS; n++) {
+    if (dc->ginCtx[n] != NULL) NCCLCHECK(backend->ncclGin->destroyContext(dc->ginCtx[n]));
   }
+  if (dc->dynamicState) NCCLCHECK(ncclCudaFree(dc->dynamicState, comm->memManager));
   free(dc);
   return ncclSuccess;
 }
@@ -551,8 +725,12 @@ ncclResult_t ncclGinQueryLastError(struct ncclGinState* ginState, bool* hasError
   std::shared_lock<std::shared_timed_mutex> rlock(ginState->devCommRwMutex);
   struct ncclGinStateDevComm* dc = ginState->devComms;
   while (dc) {
+    if (!dc->connected) {
+      dc = dc->next;
+      continue;
+    }
     struct ncclGinBackendState* backend = &ginState->backends[dc->backendIndex];
-    for (int commIdx = 0; commIdx < backend->ginCommCount; commIdx++) {
+    for (int commIdx = 0; commIdx < dc->connectionCount; commIdx++) {
       NCCLCHECK(backend->ncclGin->queryLastError(dc->ginCtx[commIdx], hasError));
       if (*hasError) return ncclSuccess;
     }

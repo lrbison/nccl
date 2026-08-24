@@ -1,0 +1,16 @@
+{
+  global:
+    ncclCheckpointGetVersion;
+    ncclCheckpointPrepare;
+    ncclCheckpointRestore;
+    ncclCommInitRank;
+    ncclCommInitRankConfig;
+    ncclCommInitRankScalable;
+    ncclCommInitAll;
+    ncclCommSplit;
+    ncclCommFinalize;
+    ncclCommDestroy;
+    ncclCommAbort;
+  local:
+    *;
+};

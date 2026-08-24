@@ -143,3 +143,35 @@ exit:
 fail:
   goto exit;
 }
+
+ncclResult_t ncclTransportCollectiveConnect(struct ncclComm* comm) {
+  if (comm == NULL || comm->nRanks <= 1) return ncclSuccess;
+  if (!ncclCommIsFullyActive(comm)) {
+    INFO(NCCL_INIT, "comm %p rank %d deferred collective reconnect for %d/%d active ranks", comm, comm->rank,
+         ncclCommCountActiveRanks(comm), comm->nRanks);
+    return ncclSuccess;
+  }
+
+  NCCLCHECK(ncclTransportRingConnect(comm));
+  comm->initAlgoChannels[NCCL_ALGO_RING] = true;
+  NCCLCHECK(ncclTransportTreeConnect(comm));
+  comm->initAlgoChannels[NCCL_ALGO_TREE] = true;
+  if (comm->maxLocalRanks == 1) {
+    NCCLCHECK(ncclTransportPatConnect(comm));
+    comm->initAlgoChannels[NCCL_ALGO_PAT] = true;
+  }
+  NCCLCHECK(ncclNvlsBufferSetup(comm));
+  comm->initAlgoChannels[NCCL_ALGO_NVLS] = true;
+  NCCLCHECK(ncclNvlsTreeConnect(comm));
+  comm->initAlgoChannels[NCCL_ALGO_NVLS_TREE] = true;
+  if (comm->config.collnetEnable) {
+    NCCLCHECK(ncclCollNetChainBufferSetup(comm));
+    comm->initAlgoChannels[NCCL_ALGO_COLLNET_CHAIN] = true;
+    if (comm->maxLocalRanks <= NCCL_MAX_DIRECT_ARITY + 1) {
+      NCCLCHECK(ncclCollNetDirectBufferSetup(comm));
+      comm->initAlgoChannels[NCCL_ALGO_COLLNET_DIRECT] = true;
+    }
+  }
+
+  return ncclSuccess;
+}

@@ -560,6 +560,7 @@ static ncclResult_t SaveProxy(struct ncclComm* comm, struct ncclChannel* channel
   struct ncclChannelPeer* peerComm = channel->peers[peer];
   struct ncclConnector* connector = type == proxyRecv ? peerComm->recv + connIndex : peerComm->send + connIndex;
   if (connector->transportComm == NULL) {
+    if (comm->joinDeferred) return ncclSuccess;
     WARN("Rank %d has no transport for %s peer %d on channel %d/%d", comm->rank, type == proxyRecv ? "recv" : "send",
          peer, channel->id, connIndex);
     return ncclInternalError;
@@ -2162,6 +2163,49 @@ ncclResult_t ncclProxyCreate(struct ncclComm* comm) {
     ncclSetThreadName(comm->proxyState->threadUDS, "NCCL UDS Svc%2d", comm->cudaDev);
   }
   return ncclSuccess;
+}
+
+ncclResult_t ncclProxyRestart(struct ncclComm* comm, struct ncclSocket* sock, union ncclSocketAddress* peerAddresses,
+                              uint64_t* peerAddressesUDS) {
+  ncclResult_t ret = ncclSuccess;
+
+  if (comm == NULL || comm->sharedRes == NULL || sock == NULL || peerAddresses == NULL || peerAddressesUDS == NULL) {
+    WARN("ncclProxyRestart: invalid restart arguments");
+    return ncclInvalidArgument;
+  }
+  if (comm->sharedRes->owner != comm || comm->proxyState != comm->sharedRes->proxyState) {
+    WARN("ncclProxyRestart: cannot restart proxy for shared-resource communicator");
+    return ncclInvalidUsage;
+  }
+  if (comm->proxyState == NULL) {
+    NCCLCHECK(ncclProxyInit(comm, sock, peerAddresses, peerAddressesUDS));
+    NCCLCHECK(ncclProxyCreate(comm));
+    return ncclSuccess;
+  }
+  if (comm->proxyState->refCount != 1) {
+    WARN("ncclProxyRestart: proxy refcount %d is not restartable", comm->proxyState->refCount);
+    return ncclInvalidUsage;
+  }
+
+  NCCLCHECKGOTO(ncclProxyStop(comm), ret, fail);
+  if (comm->proxyState && comm->proxyRefCountOld == 0 && comm->proxyState->thread.joinable()) {
+    comm->proxyState->thread.join();
+    if (comm->proxyState->threadUDS.joinable()) comm->proxyState->threadUDS.join();
+  }
+  comm->proxyState->peerAddresses = NULL;
+  comm->proxyState->peerAddressesUDS = NULL;
+  NCCLCHECKGOTO(ncclProxyDestroy(comm), ret, fail);
+  comm->sharedRes->proxyState = NULL;
+  comm->proxyState = NULL;
+  comm->proxyRefCountOld = 0;
+
+  NCCLCHECKGOTO(ncclProxyInit(comm, sock, peerAddresses, peerAddressesUDS), ret, fail);
+  NCCLCHECKGOTO(ncclProxyCreate(comm), ret, fail);
+
+exit:
+  return ret;
+fail:
+  goto exit;
 }
 
 ncclResult_t ncclProxyStop(struct ncclComm* comm) {

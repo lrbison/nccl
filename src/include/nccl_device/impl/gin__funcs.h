@@ -111,21 +111,26 @@ NCCL_DEVICE_INLINE ncclResult_t waitRollingLessEq(ncclGinOffsetPtr ref, uint64_t
 // Common initialization helper for GIN backend
 template <typename GinType>
 NCCL_DEVICE_INLINE void ncclGinInitCommon(GinType* gin, ncclDevComm const& comm, int contextIndex) {
-  gin->nConnections = comm.ginConnectionCount;
+  ncclDevCommDynamic_t const* dynamicState = comm.dynamicState;
+  uint8_t ginConnectionCount =
+    dynamicState ? nccl::utility::loadConst(&dynamicState->ginConnectionCount) : comm.ginConnectionCount;
+  gin->nConnections = ginConnectionCount;
 
   static_assert(NCCL_GIN_MAX_CONNECTIONS == 4, "Required for following modulo hack to work.");
   // this->connectionId = contextIndex % comm.ginConnectionCount;
-  gin->connectionId = comm.ginConnectionCount == 3 ? uint32_t(contextIndex) % 3 // 3 is only non power of 2
-                                                     :
-                                                     contextIndex & (comm.ginConnectionCount - 1); // powers of 2
+  gin->connectionId = ginConnectionCount == 3 ? uint32_t(contextIndex) % 3 // 3 is only non power of 2
+                                                :
+                                                contextIndex & (ginConnectionCount - 1); // powers of 2
   // gin->contextId = contextIndex / comm.ginConnectionCount;
-  gin->contextId = comm.ginConnectionCount == 3 ?
+  gin->contextId = ginConnectionCount == 3 ?
                      uint32_t(contextIndex) / 3 // 3 is only non power of 2
                      :
-                     contextIndex >> (comm.ginConnectionCount == 4 ? 2 : comm.ginConnectionCount - 1); // powers of 2
+                     contextIndex >> (ginConnectionCount == 4 ? 2 : ginConnectionCount - 1); // powers of 2
 
-  gin->_ginBackend = comm.ginNetDeviceTypes[gin->connectionId];
-  gin->_ginHandle = comm.ginHandles[gin->connectionId];
+  gin->_ginBackend = dynamicState ? nccl::utility::loadConst(&dynamicState->ginNetDeviceTypes[gin->connectionId]) :
+                                    comm.ginNetDeviceTypes[gin->connectionId];
+  gin->_ginHandle = dynamicState ? nccl::utility::loadConst(&dynamicState->ginHandles[gin->connectionId]) :
+                                   comm.ginHandles[gin->connectionId];
   gin->_signalShadows = comm.ginSignalShadows + contextIndex * comm.ginSignalCount;
 }
 

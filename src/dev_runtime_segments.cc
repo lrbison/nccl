@@ -168,13 +168,15 @@ ncclResult_t ncclDevrAllocAndPopulateSegmentWindows(struct ncclDevrState* devr, 
                                     (void**)&segmentWindowsDev, (void**)&segmentWindowsHost, stream),
                 ret, fail);
 
-  for (int backend = 0; backend < NCCL_GIN_MAX_ACTIVE_BACKENDS; backend++) {
-    for (int segment = 0; segment < mem->numGinSegments; segment++) {
-      struct ncclSegmentWindow& segWin = segmentWindowsHost[(size_t)backend * mem->numGinSegments + segment];
-      segWin.memType = mem->ginSegmentInfos[segment].memType;
-      segWin.segmentSize = mem->ginSegmentInfos[segment].segmentSize;
-      for (int i = 0; i < NCCL_GIN_MAX_CONNECTIONS; i++) {
-        segWin.ginWins[i] = mem->ginSegmentInfos[segment].ginDevWins[backend * NCCL_GIN_MAX_CONNECTIONS + i];
+  if (mem->ginSegmentInfos != nullptr) {
+    for (int backend = 0; backend < NCCL_GIN_MAX_ACTIVE_BACKENDS; backend++) {
+      for (int segment = 0; segment < mem->numGinSegments; segment++) {
+        struct ncclSegmentWindow& segWin = segmentWindowsHost[(size_t)backend * mem->numGinSegments + segment];
+        segWin.memType = mem->ginSegmentInfos[segment].memType;
+        segWin.segmentSize = mem->ginSegmentInfos[segment].segmentSize;
+        for (int i = 0; i < NCCL_GIN_MAX_CONNECTIONS; i++) {
+          segWin.ginWins[i] = mem->ginSegmentInfos[segment].ginDevWins[backend * NCCL_GIN_MAX_CONNECTIONS + i];
+        }
       }
     }
   }

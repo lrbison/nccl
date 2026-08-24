@@ -3484,6 +3484,14 @@ ncclResult_t ncclEnqueueCheck(struct ncclInfo* info) {
   int devOld = -1;
   // Check whether communicator is ready to communicate
   NCCLCHECKGOTO(ncclCommEnsureReady(info->comm), ret, fail);
+  if (info->coll != ncclFuncSend && info->coll != ncclFuncRecv && info->coll != ncclFuncPutSignal &&
+      info->coll != ncclFuncSignal && info->coll != ncclFuncWaitSignal && !info->comm->joinDeferred &&
+      !ncclCommIsFullyActive(info->comm)) {
+    WARN("%s: communicator has only %d/%d active ranks", info->opName, ncclCommCountActiveRanks(info->comm),
+         info->comm->nRanks);
+    ret = ncclInvalidUsage;
+    goto fail;
+  }
 
   if (info->comm->checkMode != ncclCheckModeDefault) {
     CUDACHECKGOTO(cudaGetDevice(&devOld), ret, fail);

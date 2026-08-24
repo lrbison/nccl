@@ -48,6 +48,7 @@ static_assert(sizeof(struct rasNotification) <= PIPE_BUF, "The rasNotification s
 // These ensure that we get only one RAS port/thread per process.
 static std::mutex rasInitMutex;
 static bool rasInitialized = false;
+static bool rasTerminateRegistered = false;
 static int rasInitRefCount = 0;
 
 // The RAS network listening socket of this RAS thread (random port).
@@ -121,7 +122,10 @@ ncclResult_t ncclRasCommInit(struct ncclComm* comm, struct rasRankInit* myRank) 
 
       rasInitialized = true;
 
-      atexit(rasTerminate);
+      if (!rasTerminateRegistered) {
+        atexit(rasTerminate);
+        rasTerminateRegistered = true;
+      }
     }
   }
   ncclAtomicRefCountIncrement(&rasInitRefCount);
@@ -165,7 +169,7 @@ ncclResult_t ncclRasCommFini(const struct ncclComm* comm) {
       }
     }
   }
-  ncclAtomicRefCountDecrement(&rasInitRefCount);
+  if (ncclAtomicRefCountDecrement(&rasInitRefCount) == 0) rasTerminate();
   return ncclSuccess;
 }
 

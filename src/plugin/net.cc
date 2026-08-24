@@ -104,6 +104,11 @@ static ncclResult_t ncclNetPluginUnload(netPluginLib_t* pluginLib) {
   return ncclSuccess;
 }
 
+static void ncclNetPluginClearDiscoveryState(netPluginLib_t* pluginLib) {
+  pluginLib->netPhysDevs = pluginLib->netVirtDevs = NCCL_UNDEF_DEV_COUNT;
+  pluginLib->collNetPhysDevs = pluginLib->collNetVirtDevs = NCCL_UNDEF_DEV_COUNT;
+}
+
 static ncclResult_t ncclNetPluginLoad(netPluginLib_t* pluginLib) {
   pluginLib->dlHandle = ncclOpenNetPluginLib(pluginLib->name);
 
@@ -195,8 +200,11 @@ static ncclResult_t ncclNetPluginInit(struct ncclComm* comm, netPluginLib_t* plu
     }
     initCompleted = true;
   }
-  // Detection of the devices is only done when the plugin is being initialized the first time
-  if (pluginLib->ncclNetPluginState == ncclNetPluginStateInitReady && pluginLib->ncclNet) {
+  // Detection of the devices is only done when the plugin is being initialized the first time, or after quiesce.
+  if (pluginLib->ncclNetPluginState >= ncclNetPluginStateInitReady &&
+      (pluginLib->ncclNetPluginState == ncclNetPluginStateInitReady ||
+       pluginLib->netPhysDevs == NCCL_UNDEF_DEV_COUNT) &&
+      pluginLib->ncclNet) {
     if (pluginLib->ncclNet->devices(&ndev) != ncclSuccess || ndev <= 0) goto fail;
     pluginLib->netPhysDevs = ndev;
     pluginLib->netVirtDevs = NCCL_UNDEF_DEV_COUNT;
@@ -210,8 +218,11 @@ static ncclResult_t ncclNetPluginInit(struct ncclComm* comm, netPluginLib_t* plu
       pluginLib->ncclCollNetPluginState = ncclNetPluginStateDisabled;
     }
   }
-  // Detection of the devices is only done when the plugin is being initialized the first time
-  if (pluginLib->ncclCollNetPluginState == ncclNetPluginStateInitReady && pluginLib->ncclCollNet) {
+  // Detection of the devices is only done when the plugin is being initialized the first time, or after quiesce.
+  if (pluginLib->ncclCollNetPluginState >= ncclNetPluginStateInitReady &&
+      (pluginLib->ncclCollNetPluginState == ncclNetPluginStateInitReady ||
+       pluginLib->collNetPhysDevs == NCCL_UNDEF_DEV_COUNT) &&
+      pluginLib->ncclCollNet) {
     if (pluginLib->ncclCollNet->devices(&ndev) != ncclSuccess || ndev <= 0) {
       pluginLib->ncclCollNetPluginState = ncclNetPluginStateDisabled;
     } else {
@@ -226,8 +237,7 @@ exit:
 fail:
   INFO(NCCL_INIT | NCCL_NET, "Failed to initialize NET plugin %s", pluginLib->ncclNet->name);
   if (initCompleted) pluginLib->ncclNet->finalize(comm->netContext);
-  pluginLib->netPhysDevs = pluginLib->netVirtDevs = NCCL_UNDEF_DEV_COUNT;
-  pluginLib->collNetPhysDevs = pluginLib->collNetVirtDevs = NCCL_UNDEF_DEV_COUNT;
+  ncclNetPluginClearDiscoveryState(pluginLib);
   pluginLib->ncclNetPluginState = ncclNetPluginStateDisabled;
   pluginLib->ncclCollNetPluginState = ncclNetPluginStateDisabled;
   goto exit;
@@ -343,6 +353,16 @@ static ncclResult_t ncclNetPluginFinalize(struct ncclComm* comm, int pluginIndex
     NCCLCHECK(netPluginLibs[pluginIndex].ncclCollNet->finalize(comm->collNetContext));
   }
   netPluginLibs[pluginIndex].ncclNetPluginRefCount--;
+  if (netPluginLibs[pluginIndex].ncclNetPluginRefCount == 0) {
+    netPluginLibs[pluginIndex].netPhysDevs = netPluginLibs[pluginIndex].netVirtDevs = NCCL_UNDEF_DEV_COUNT;
+    netPluginLibs[pluginIndex].collNetPhysDevs = netPluginLibs[pluginIndex].collNetVirtDevs = NCCL_UNDEF_DEV_COUNT;
+    if (netPluginLibs[pluginIndex].ncclNetPluginState == ncclNetPluginStateEnabled) {
+      netPluginLibs[pluginIndex].ncclNetPluginState = ncclNetPluginStateInitReady;
+    }
+    if (netPluginLibs[pluginIndex].ncclCollNetPluginState == ncclNetPluginStateEnabled) {
+      netPluginLibs[pluginIndex].ncclCollNetPluginState = ncclNetPluginStateInitReady;
+    }
+  }
 #if defined(NCCL_OS_LINUX)
   if (pluginIndex < (pluginCount - NCCL_NET_NUM_INTERNAL_PLUGINS)) {
     NCCLCHECK(ncclNetPluginUnload(&netPluginLibs[pluginIndex]));
@@ -410,6 +430,117 @@ ncclResult_t ncclNetFinalize(struct ncclComm* comm) {
   std::lock_guard<std::mutex> lock(netPluginMutex);
   NCCLCHECK(ncclNetPluginFinalize(comm, pluginIndex));
   return ncclSuccess;
+}
+
+static ncclResult_t ncclNetPluginQuiesce(int pluginIndex) {
+  netPluginLib_t* pluginLib = netPluginLibs + pluginIndex;
+  bool isExternal = pluginIndex < (pluginCount - NCCL_NET_NUM_INTERNAL_PLUGINS);
+  ncclResult_t ret = ncclSuccess;
+
+  if (isExternal) {
+    if (pluginLib->ncclNetPluginState == ncclNetPluginStateEnabled && pluginLib->ncclNetPluginRefCount != 0) {
+      WARN("NET quiesce: external plugin %s has %d active communicator references and no quiesce callback",
+           pluginLib->name, pluginLib->ncclNetPluginRefCount);
+      return ncclInvalidUsage;
+    }
+    ncclNetPluginClearDiscoveryState(pluginLib);
+    if (pluginLib->ncclNetPluginRefCount == 0) NCCLCHECK(ncclNetPluginUnload(pluginLib));
+    return ncclSuccess;
+  }
+
+  if (pluginLib->ncclNet == &ncclNetIb) {
+    NCCLCHECKGOTO(ncclIbQuiesceDevices(), ret, exit);
+  } else if (pluginLib->ncclNet == &ncclNetSocket) {
+    NCCLCHECKGOTO(ncclNetSocketRediscover(), ret, exit);
+  } else if (pluginLib->ncclNetPluginState == ncclNetPluginStateEnabled && pluginLib->ncclNetPluginRefCount != 0) {
+    WARN("NET quiesce: plugin %s has %d active communicator references and no quiesce implementation",
+         pluginLib->ncclNet ? pluginLib->ncclNet->name : pluginLib->name, pluginLib->ncclNetPluginRefCount);
+    ret = ncclInvalidUsage;
+    goto exit;
+  }
+
+  ncclNetPluginClearDiscoveryState(pluginLib);
+  INFO(NCCL_INIT | NCCL_NET, "NET quiesce: cleared plugin %s discovery state, refCount=%d",
+       pluginLib->ncclNet ? pluginLib->ncclNet->name : pluginLib->name, pluginLib->ncclNetPluginRefCount);
+
+exit:
+  return ret;
+}
+
+ncclResult_t ncclNetQuiesceInternal(void) {
+  ncclResult_t ret = ncclSuccess;
+
+  std::call_once(initPluginLibsOnceFlag, initPluginLibsOnceFunc);
+  std::lock_guard<std::mutex> lock(netPluginMutex);
+
+  for (int pluginIndex = 0; pluginIndex < pluginCount; pluginIndex++) {
+    ncclResult_t pluginRet = ncclNetPluginQuiesce(pluginIndex);
+    if (ret == ncclSuccess && pluginRet != ncclSuccess) ret = pluginRet;
+  }
+  if (ret == ncclSuccess) INFO(NCCL_INIT | NCCL_NET, "NET quiesce complete");
+  return ret;
+}
+
+ncclResult_t ncclNetRediscover(struct ncclComm* comm) {
+  ncclResult_t ret = ncclSuccess;
+
+  if (comm == NULL) return ncclInvalidArgument;
+  std::call_once(initPluginLibsOnceFlag, initPluginLibsOnceFunc);
+  std::lock_guard<std::mutex> lock(netPluginMutex);
+
+  int pluginIndex = comm->netPluginIndex;
+  if (pluginIndex < 0 || pluginIndex >= pluginCount || netPluginLibs[pluginIndex].ncclNet == NULL) {
+    WARN("NET rediscover: communicator has invalid net plugin index %d", pluginIndex);
+    return ncclInternalError;
+  }
+
+  netPluginLib_t* pluginLib = netPluginLibs + pluginIndex;
+  NCCLCHECKGOTO(pluginLib->ncclNet->finalize(comm->netContext), ret, fail);
+  comm->netContext = NULL;
+  if (pluginLib->ncclCollNet != NULL && comm->collNetContext != NULL &&
+      pluginLib->ncclCollNetPluginState == ncclNetPluginStateEnabled) {
+    NCCLCHECKGOTO(pluginLib->ncclCollNet->finalize(comm->collNetContext), ret, fail);
+    comm->collNetContext = NULL;
+  }
+  if (pluginLib->ncclNetPluginRefCount > 0) pluginLib->ncclNetPluginRefCount--;
+
+  comm->ncclNet = NULL;
+  comm->ncclCollNet = NULL;
+  ncclNetPluginClearDiscoveryState(pluginLib);
+  if (pluginLib->ncclNet == &ncclNetSocket) NCCLCHECKGOTO(ncclNetSocketRediscover(), ret, fail);
+
+  if (pluginIndex < (pluginCount - NCCL_NET_NUM_INTERNAL_PLUGINS) && pluginLib->ncclNetPluginRefCount == 0) {
+    NCCLCHECKGOTO(ncclNetPluginUnload(pluginLib), ret, fail);
+    if (pluginLib->ncclNetPluginState == ncclNetPluginStateLoadReady) {
+      NCCLCHECKGOTO(ncclNetPluginLoad(pluginLib), ret, fail);
+    }
+  }
+  if (pluginLib->ncclNetPluginState == ncclNetPluginStateEnabled) {
+    pluginLib->ncclNetPluginState = ncclNetPluginStateInitReady;
+  }
+  if (pluginLib->ncclCollNetPluginState == ncclNetPluginStateEnabled) {
+    pluginLib->ncclCollNetPluginState = ncclNetPluginStateInitReady;
+  }
+
+  NCCLCHECKGOTO(ncclNetPluginInit(comm, pluginLib), ret, fail);
+  if (pluginLib->ncclNetPluginState == ncclNetPluginStateEnabled) {
+    bool isAssigned = false;
+    NCCLCHECKGOTO(ncclNetPluginAssignToComm(comm, pluginIndex, &isAssigned), ret, fail);
+    if (!isAssigned) {
+      WARN("NET rediscover: failed to reassign NET plugin %s", pluginLib->ncclNet->name);
+      ret = ncclInvalidUsage;
+      goto fail;
+    }
+  } else {
+    WARN("NET rediscover: failed to reinitialize NET plugin");
+    ret = ncclInvalidUsage;
+    goto fail;
+  }
+
+exit:
+  return ret;
+fail:
+  goto exit;
 }
 
 ncclResult_t ncclNetGetDevCount(int netPluginIndex, int* nPhysDevs, int* nVirtDevs) {

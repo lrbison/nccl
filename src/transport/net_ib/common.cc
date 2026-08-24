@@ -162,10 +162,30 @@ static void ncclIbUpdateDeviceSpeed(struct ncclIbDev* dev) {
   }
 }
 
-std::thread ncclIbAsyncThread;
+struct ncclIbAsyncThreadState ncclIbAsyncThreads[MAX_IB_DEVS];
 void* ncclIbAsyncThreadMain(void* args) {
-  struct ncclIbDev* dev = (struct ncclIbDev*)args;
+  struct ncclIbAsyncThreadState* state = (struct ncclIbAsyncThreadState*)args;
+  struct ncclIbDev* dev = state->dev;
   while (1) {
+    struct pollfd fds[2];
+    fds[0].fd = dev->context->async_fd;
+    fds[0].events = POLLIN;
+    fds[0].revents = 0;
+    fds[1].fd = state->stopPipe[0];
+    fds[1].events = POLLIN;
+    fds[1].revents = 0;
+    int pollRet;
+    do {
+      pollRet = poll(fds, 2, -1);
+    } while (pollRet == -1 && errno == EINTR);
+    if (pollRet == -1) {
+      WARN("NET/IB : %s:%d async event poll failed: %s", dev->devName, dev->portNum, strerror(errno));
+      break;
+    }
+    if (fds[1].revents != 0) break;
+    if ((fds[0].revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) break;
+    if ((fds[0].revents & POLLIN) == 0) continue;
+
     struct ibv_async_event event;
     if (ncclSuccess != wrap_ibv_get_async_event(dev->context, &event)) break;
     char* str;

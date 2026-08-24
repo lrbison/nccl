@@ -288,7 +288,7 @@ ncclResult_t ncclPrepareTasksAndCollPreconnectFunc(struct ncclAsyncJob* job_) {
   CUDACHECK(cudaSetDevice(comm->cudaDev));
   if (!job_->isThreadMain && ncclOsCpuCount(comm->cpuAffinity)) ncclOsSetAffinity(comm->cpuAffinity);
   NCCLCHECK(ncclPrepareTasks(comm, algoNeedConnect, &needConnect, job->simInfo));
-  if (comm->cuMemSupport && needConnect) NCCLCHECK(ncclCollPreconnect(comm, algoNeedConnect));
+  if (comm->cuMemSupport && needConnect && !comm->joinDeferred) NCCLCHECK(ncclCollPreconnect(comm, algoNeedConnect));
   return ncclSuccess;
 }
 
@@ -724,7 +724,7 @@ static ncclResult_t ncclPrepareTasksAndCollPreconnect(
     CUDACHECK(cudaSetDevice(comm->cudaDev));
     NCCLCHECK(ncclPrepareTasks(comm, algoNeedConnect, &needConnect, simInfo));
 
-    if (comm->cuMemSupport && needConnect) {
+    if (comm->cuMemSupport && needConnect && !comm->joinDeferred) {
       ncclResult_t ret;
       struct ncclPreconnectJob* job;
       NEW_NOTHROW(job, ncclPreconnectJob);

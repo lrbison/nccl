@@ -26,6 +26,7 @@
 #include "argcheck.h"
 #include "mem_manager.h"
 #include "tuning.h"
+#include "rank_mask.h"
 #include "enqueue/raw_task.h"
 #include "enqueue/task_pretuning.h"
 #include "enqueue/task_classify.h"
@@ -50,6 +51,42 @@ struct cudaLaunchParams {
 #define CACHE_LINE_SIZE 128
 #define MEM_ALIGN 4096
 #define CUDA_IPC_MIN 2097152UL
+
+struct ncclXml;
+
+struct ncclJoinGraphInfo {
+  int pattern;
+  int nChannels;
+  int sameChannels;
+  float bwIntra;
+  float bwInter;
+  int typeIntra;
+  int typeInter;
+  int crossNic;
+};
+
+struct ncclJoinAllGatherInfo {
+  struct ncclJoinGraphInfo graphInfo[NCCL_NUM_ALGORITHMS];
+  struct ncclTopoRanks topoRanks;
+  int cpuArch;
+  int cpuVendor;
+  int localRanks;
+  int p2pnChannelsPerPeer;
+  int p2pMaxPeers;
+  float minNetBw;
+  int localNetDeviceCount;
+  int localNetCountByBw;
+  float localNetBw;
+  int localCollNetCount;
+  int isAllNvlink;
+};
+
+struct ncclJoinInitData {
+  struct ncclJoinAllGatherInfo* allGatherData;
+  void* topoXml;
+  size_t topoXmlSize;
+  int topoXmlMaxNodes;
+};
 
 // Channels / LL tuning
 #define NCCL_LL_THREAD_THRESHOLD 8
@@ -569,6 +606,7 @@ typedef enum ncclGroupTaskType {
 } ncclGroupTaskType_t;
 
 struct ncclCommSymTeams;
+struct ncclReshapeLeaderState;
 
 // NCCL_CHECK_MODE=DEBUG_LOCAL/DEBUG_GLOBAL
 // ncclCheckModeDebugLocal : check the input args/pointers locally, it replaces ncclParamCheckPointers()
@@ -593,6 +631,7 @@ struct ncclComm {
   struct ncclChannel channels[MAXCHANNELS];
   struct ncclPeerInfo* peerInfo;
   struct ncclTopoSystem* topo;
+  struct ncclJoinInitData joinInitData;
   struct ncclProxyConnector* gproxyConn;
   struct ncclIntruQueue<struct ncclCommCallback, &ncclCommCallback::next> legacyRegCleanupQueue;
   bool peerInfoValid;
@@ -618,6 +657,9 @@ struct ncclComm {
   int maxTreePattern;
   bool initAlgoChannels[NCCL_NUM_ALGORITHMS];
   bool runtimeConn; // if dynamic connection is supported
+  bool joinDeferred; // communicator is in join-connect setup before peer transports are reconnected
+  struct ncclReshapeLeaderState* reshapeLeader;
+  struct ncclSocket* reshapeJoinerSock;
   bool directMode; // if any process manages more than one local rank
   int cuMemSupport;
 
@@ -627,6 +669,8 @@ struct ncclComm {
   uint64_t commHash;
   int rank;    // my rank in the communicator
   int nRanks;  // number of GPUs in communicator
+  ncclCommMaskValue_t* activeRankMask; // host-side active rank state, one value per rank slot
+  uint64_t membershipEpoch;
   int cudaDev; // my cuda device index
   int nvmlDev; // my nvml device index
   int compCap; // compute capability of the GPU
@@ -875,6 +919,25 @@ inline bool ncclNvlsSymmetricMultimemEnabled(const struct ncclComm* comm) {
 static_assert(offsetof(struct ncclComm, startMagic) == 0, "startMagic must be the first field of ncclComm");
 static_assert(offsetof(struct ncclComm, endMagic) == sizeof(struct ncclComm) - sizeof(uint64_t),
               "endMagic must be the last field of ncclComm");
+
+inline bool ncclCommIsRankActive(const struct ncclComm* comm, int rank) {
+  if (comm == nullptr) return false;
+  return ncclRankMaskIsActive(comm->activeRankMask, comm->nRanks, rank);
+}
+
+inline int ncclCommCountActiveRanks(const struct ncclComm* comm) {
+  if (comm == nullptr) return 0;
+  return ncclRankMaskCountActive(comm->activeRankMask, comm->nRanks);
+}
+
+inline bool ncclCommIsFullyActive(const struct ncclComm* comm) {
+  return comm != nullptr && ncclRankMaskIsFullyActive(comm->activeRankMask, comm->nRanks);
+}
+
+inline ncclResult_t ncclCommSetRankActive(struct ncclComm* comm, int rank, bool active) {
+  if (comm == nullptr) return ncclInvalidArgument;
+  return ncclRankMaskSetActive(comm->activeRankMask, comm->nRanks, rank, active);
+}
 
 enum ncclLaunchMode {
   ncclLaunchModeInvalid = 0,

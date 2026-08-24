@@ -20,8 +20,19 @@
 struct ncclGinStateDevComm {
   int contextCount;
   int backendIndex;  // index into ncclGinState::backends[] for the backend that owns these contexts
+  int devContextCount;
+  int connectionCount;
+  int ginSignalCount;
+  int ginCounterCount;
+  int ginQueueDepth;
+  int ginTrafficClass;
+  int backendVersion;
+  int rankStride;
+  bool connected;
+  bool deferred;
   void* ginCtx[NCCL_GIN_MAX_CONNECTIONS];
   ncclNetDeviceHandle_t* devHandles[NCCL_GIN_MAX_CONNECTIONS];
+  struct ncclDevCommDynamic* dynamicState;
   struct ncclGinStateDevComm* next;
 };
 
@@ -33,6 +44,7 @@ struct ncclGinBackendState {
   int ginCommCount;
   void* ginComms[NCCL_GIN_MAX_CONNECTIONS];
   ncclNetProperties_t ginProps[NCCL_GIN_MAX_CONNECTIONS];
+  int ginVersion;
   bool supportsStrongSignals;
   bool supportsVASignals;
 };
@@ -71,6 +83,8 @@ ncclResult_t ncclGinConnectOnce(struct ncclComm* comm);
 ncclResult_t ncclGinHostFinalize(struct ncclComm* comm);
 ncclResult_t ncclGinDevCommSetup(struct ncclComm* comm, struct ncclDevCommRequirements const* reqs,
                                  struct ncclDevComm* devComm, uint32_t deviceCodeVersion);
+ncclResult_t ncclGinDevCommDisconnectAll(struct ncclComm* comm);
+ncclResult_t ncclGinDevCommConnectAll(struct ncclComm* comm);
 ncclResult_t ncclGinDevCommFree(struct ncclComm* comm, struct ncclDevComm const* devComm);
 ncclResult_t ncclGinRegister(struct ncclComm* comm, void* address, size_t size,
                              void* ginHostWins[NCCL_GIN_MAX_CONNECTIONS * NCCL_GIN_MAX_ACTIVE_BACKENDS],

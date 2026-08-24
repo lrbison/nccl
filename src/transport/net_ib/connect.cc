@@ -89,6 +89,7 @@ ncclResult_t ncclIbDestroyBase(struct ncclIbNetCommDevBase* base) {
   std::lock_guard<std::mutex> lock(ncclIbDevs[base->ibDevN].mutex);
   if (0 == --ncclIbDevs[base->ibDevN].pdRefs) {
     NCCLCHECK(wrap_ibv_dealloc_pd(ncclIbDevs[base->ibDevN].pd));
+    ncclIbDevs[base->ibDevN].pd = NULL;
   }
   return ncclSuccess;
 }

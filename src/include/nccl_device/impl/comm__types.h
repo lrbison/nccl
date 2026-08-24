@@ -25,6 +25,13 @@ struct ncclDevCommWindowTable {
 #endif
 typedef struct ncclDevCommWindowTable* ncclDevCommWindowTable_t;
 
+struct ncclDevCommDynamic {
+  uint8_t ginConnectionCount;
+  uint8_t ginNetDeviceTypes[NCCL_GIN_MAX_CONNECTIONS];
+  void* ginHandles[NCCL_GIN_MAX_CONNECTIONS];
+};
+typedef struct ncclDevCommDynamic ncclDevCommDynamic_t;
+
 struct ncclDevComm {
   // Internal NCCL structure versioning metadata.  Do not modify.
   unsigned int magic;
@@ -75,6 +82,8 @@ struct ncclDevComm {
   ncclCftLeId mcLeId; // MC LE ID, +1 for counted MC LE ID
   ncclCftBarrierHandle_t cftBarrier;
   ncclCftBarrierHandle_t cftMultimemBarrier;
+
+  ncclDevCommDynamic_t* dynamicState;
 };
 
 #endif // _NCCL_DEVICE_COMM__TYPES_H_

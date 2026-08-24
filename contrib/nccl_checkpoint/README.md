@@ -1,10 +1,11 @@
 # NCCL Checkpoint Shim
 
 This library enables a collective checkpoint of all processes that are part of
-one or more NCCL communicators across multiple hosts.  During restore, all NCCL
-communicators and state are re-created by the library, so application execution
-may resume naturally without the application reconfiguring communicators.  This
-enables model warmup to be included in checkpoints.
+one or more NCCL communicators across multiple hosts.  During checkpoint
+preparation, the shim masks every tracked communicator down to the local rank.
+During restore, rank 0 of each communicator accepts the remaining ranks back
+into the communicator with NCCL's mask/join APIs.  Application communicator
+handles remain the original NCCL communicator pointers.
 
 # Maintainers
 
@@ -16,26 +17,26 @@ enables model warmup to be included in checkpoints.
 
 The application is launched with
 `LD_PRELOAD=/path/to/libnccl-checkpoint-shim.so` in the environment.  This
-allows the library to intercept all calls to NCCL functions to capture all
-resource initialization steps.
+allows the library to intercept communicator creation and destruction calls.
 
 Checkpointing is a collective operation which involves all processes which share
 one or more NCCL communicators.
 
 Prior to checkpoint, the application invokes `ncclCheckpointPrepare()` and all
-communicators will be destroyed to allow checkpointing via CUDA Checkpoint and
-CRIU.
+communicators will be masked so that only the local rank remains active.  No
+communicator handles are replaced.
 
 On checkpoint restore, the application invokes `ncclCheckpointRestore()` and the
-library replays all NCCL configuration steps, ensuring it returns the same
-pointers/identifiers as it had prior to checkpointing.
+library rejoins all ranks into each tracked communicator.  Rank 0 of each
+communicator acts as the survivor and publishes a new join unique ID.  All other
+ranks use their existing communicator as joiners.
 
 Because it is useful to restore on different hardware, IP addresses may have
 changed.  There is no convenient way to directly inform the NCCL Checkpoint
 library of all peer addresses during the restore process, so the library
-depends on a temporary Redis Key-Value store to be made available.  Using the
-Key-Value store, NCCL communicators are able to rendezvous with peers and
-re-create all communicator resources.
+depends on a temporary Redis Key-Value store to be made available.  The shim
+uses the Key-Value store to publish the join unique ID for each communicator
+during restore.
 
 ## Usage Examples
 
@@ -116,17 +117,21 @@ be callable.
 The variable `NCCL_CHECKPOINT_KVS_PATH` is discussed in the **Environment**
 section.
 
-## Limitations
+## Current POC Assumptions
 
 The NCCL Checkpointing library continues to improve, but at this time the
-following limitations exist.  These limitations will be addressed in a coming
-release.
+following assumptions exist.  These assumptions will be addressed in future
+development.
 
-- Pointers returned by `ncclWinGetUserPtr()` before checkpoint are not valid
-  after restore.
-- CUDA graph capture is not supported.
-- The device API is not supported. `ncclDevComm` objects and device-visible
-  `ncclWindow_t` values cannot be restored.
+- Before `ncclCheckpointPrepare()`, tracked communicators must have a full
+  active-rank mask.
+- After `ncclCheckpointRestore()`, tracked communicators are expected to be
+  fully active.
+- Rank 0 of each communicator is the restore survivor.  All other ranks rejoin
+  using their existing communicator.
+- Communicator creation and destruction must not race with prepare or restore.
+- `ncclCommShrink` and `ncclCommGrow` are not checkpoint-managed in this first
+  implementation.
 
 
 # Installation

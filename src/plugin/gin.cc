@@ -183,6 +183,7 @@ static ncclResult_t ncclGinPluginAssignToComm(struct ncclComm* comm, int pluginI
     backend->ncclGin = gin;
     backend->ginInstance = ginContext;
     backend->pluginIndex = pluginIndex;
+    backend->ginVersion = pluginLibs[pluginIndex].version;
     ginState->supported = true;
 
     ncclGinProperties_t ginProperties;

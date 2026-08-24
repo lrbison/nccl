@@ -35,13 +35,19 @@ static int netRefCount;
 ncclResult_t ncclNetSocketInit(void** ctx, uint64_t commId, ncclNetCommConfig_t* config, ncclDebugLogger_t logFunction,
                                ncclProfilerCallback_t profFunction) {
   std::lock_guard<std::mutex> lock(ncclNetSocketMutex);
-  if (netRefCount) {
+  if (netRefCount && ncclNetIfs != -1) {
     netRefCount++;
     return ncclSuccess;
   }
   ncclProfilerFunction = profFunction;
   NCCLCHECK(ncclNetSocketInitDevices("NET/Socket"));
   netRefCount++;
+  return ncclSuccess;
+}
+
+ncclResult_t ncclNetSocketRediscover() {
+  std::lock_guard<std::mutex> lock(ncclNetSocketMutex);
+  NCCLCHECK(ncclNetSocketResetDevices());
   return ncclSuccess;
 }
 

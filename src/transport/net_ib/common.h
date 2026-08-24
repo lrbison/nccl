@@ -25,6 +25,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 #include <mutex>
+#include <thread>
 #define ENABLE_TIMER 0
 #include "timer.h"
 
@@ -136,6 +137,15 @@ extern int ncclIbRelaxedOrderingEnabled;
 extern uint64_t ncclIbSpeedChangeCounter;
 extern int64_t ncclParamIbEventBasedLb();
 extern int64_t ncclParamIbEventBasedLbRemote();
+
+struct ncclIbAsyncThreadState {
+  // Heap-owned so process shutdown does not run std::thread's destructor on a joinable static object.
+  std::thread* thread;
+  struct ncclIbDev* dev;
+  int stopPipe[2];
+
+  ncclIbAsyncThreadState() : thread(NULL), dev(NULL), stopPipe{-1, -1} {}
+};
 
 #define NCCL_IB_LLSTR(ll) \
   (((ll) == IBV_LINK_LAYER_INFINIBAND) ? "IB" : (((ll) == IBV_LINK_LAYER_ETHERNET) ? "RoCE" : "UNSPECIFIED"))
@@ -688,8 +698,9 @@ ncclResult_t ncclIbStatsCheckFatalCount(struct ncclIbStats* stat, const char* fu
 
 extern ncclProfilerCallback_t ncclProfilerFunction;
 
-extern std::thread ncclIbAsyncThread;
+extern struct ncclIbAsyncThreadState ncclIbAsyncThreads[MAX_IB_DEVS];
 void* ncclIbAsyncThreadMain(void* args);
+void ncclGinIbGdakiResetDevices();
 
 ncclResult_t ncclIbGdrSupport();
 ncclResult_t ncclIbPeerMemSupport();
@@ -740,6 +751,7 @@ ncclResult_t ncclIbCloseRecv(void* recvComm);
 ncclResult_t ncclIbCloseListen(void* listenComm);
 ncclResult_t ncclIbMakeVDevice(int* d, ncclNetVDeviceProps_t* props);
 ncclResult_t ncclIbFinalizeDevices(void);
+ncclResult_t ncclIbQuiesceDevices(void);
 ncclResult_t ncclIbFinalize(void* ctx);
 ncclResult_t ncclIbSetNetAttr(void* ctx, ncclNetAttr_t* netAttr);
 

@@ -78,7 +78,8 @@ enum ncclSocketType {
   ncclSocketTypeNetSocket = 3,
   ncclSocketTypeNetIb = 4,
   ncclSocketTypeRasNetwork = 5,
-  ncclSocketTypeNetNd = 6
+  ncclSocketTypeNetNd = 6,
+  ncclSocketTypeJoinRoot = 7
 };
 
 struct ncclSocket {

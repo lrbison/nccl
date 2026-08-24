@@ -22,6 +22,7 @@ extern int ncclNetIfs;
 extern struct ncclNetSocketDev ncclNetSocketDevs[MAX_IFS];
 
 ncclResult_t ncclNetSocketInitDevices(const char* logPrefix);
+ncclResult_t ncclNetSocketResetDevices();
 ncclResult_t ncclNetSocketGetSpeed(char* devName, int* speed);
 /* Initialize a caller-owned listener and publish its bootstrap address and magic. */
 ncclResult_t ncclNetSocketCreateListener(const char* logPrefix, int dev, struct ncclSocket* sock,
