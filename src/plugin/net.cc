@@ -151,6 +151,22 @@ fail:
   pluginLib->ncclCollNetPluginState = ncclNetPluginStateLoadFailed;
   goto exit;
 }
+#else
+static ncclResult_t ncclNetPluginUnload(netPluginLib_t* pluginLib) {
+  (void)pluginLib;
+  return ncclSuccess;
+}
+
+static void ncclNetPluginClearDiscoveryState(netPluginLib_t* pluginLib) {
+  pluginLib->netPhysDevs = pluginLib->netVirtDevs = NCCL_UNDEF_DEV_COUNT;
+  pluginLib->collNetPhysDevs = pluginLib->collNetVirtDevs = NCCL_UNDEF_DEV_COUNT;
+}
+
+static ncclResult_t ncclNetPluginLoad(netPluginLib_t* pluginLib) {
+  pluginLib->ncclNetPluginState = ncclNetPluginStateLoadFailed;
+  pluginLib->ncclCollNetPluginState = ncclNetPluginStateLoadFailed;
+  return ncclSuccess;
+}
 #endif
 
 ncclResult_t ncclNetCheckDeviceVersion(struct ncclComm* comm, ncclNet_t* net, int dev) {
