@@ -222,28 +222,32 @@ static ncclResult_t ncclGdrCudaMapPointer(void* data, size_t size, gdr_mh_t* mh,
 
 template <typename T>
 static ncclResult_t ncclGdrCudaCalloc(T** ptr, T** devPtr, size_t nelem, void** gdrHandle, struct ncclMemManager* manager, uint32_t pinFlags = 0) {
+  ncclResult_t ret = ncclSuccess;
   ncclGdrInfo_t info = {};
   size_t mapSize;
-  gdr_mh_t mh;
-  char *devMem;
-  void *gdrMap;
+  gdr_mh_t mh = {};
+  char* devMem = nullptr;
+  void* gdrMap = nullptr;
+  gdr_mem_desc_t* md = nullptr;
+  uint64_t alignedAddr = 0;
+  size_t align = 0;
+  ssize_t off = 0;
 
   mapSize = ncclSizeOfT<T>()*nelem;
 
   // GDRCOPY Pinned buffer has to be a minimum of a GPU_PAGE_SIZE
   ALIGN_SIZE(mapSize, GPU_PAGE_SIZE);
   // GDRCOPY Pinned buffer has to be GPU_PAGE_SIZE aligned too
-  NCCLCHECK(ncclCudaCalloc(&devMem, mapSize+GPU_PAGE_SIZE-1, manager));
-  uint64_t alignedAddr = (((uint64_t) devMem) + GPU_PAGE_OFFSET) & GPU_PAGE_MASK;
-  size_t align = alignedAddr - (uint64_t)devMem;
+  NCCLCHECKGOTO(ncclCudaCalloc(&devMem, mapSize+GPU_PAGE_SIZE-1, manager), ret, fail);
+  alignedAddr = (((uint64_t) devMem) + GPU_PAGE_OFFSET) & GPU_PAGE_MASK;
+  align = alignedAddr - (uint64_t)devMem;
 
-  NCCLCHECK(ncclGdrCudaMapAligned(alignedAddr, mapSize, &mh, &gdrMap, &info, pinFlags));
+  NCCLCHECKGOTO(ncclGdrCudaMapAligned(alignedAddr, mapSize, &mh, &gdrMap, &info, pinFlags), ret, fail);
 
   // Will offset ever be non zero ?
-  ssize_t off = info.va - alignedAddr;
+  off = info.va - alignedAddr;
 
-  gdr_mem_desc_t* md;
-  NCCLCHECK(ncclCalloc(&md, 1));
+  NCCLCHECKGOTO(ncclCalloc(&md, 1), ret, fail_unmap);
   md->gdrDevMem = devMem;
   md->gdrMap = gdrMap;
   md->gdrMapSize = mapSize;
@@ -258,6 +262,15 @@ static ncclResult_t ncclGdrCudaCalloc(T** ptr, T** devPtr, size_t nelem, void** 
        md->gdrDevMem, md->gdrMap, md->gdrOffset, md->gdrMh.h, md->gdrMapSize, *ptr);
 
   return ncclSuccess;
+
+fail_unmap:
+  (void)ncclGdrCudaUnmapPointer(mh, gdrMap, mapSize);
+fail:
+  if (devMem != nullptr) (void)ncclCudaFree(devMem, manager);
+  if (gdrHandle) *gdrHandle = nullptr;
+  *ptr = nullptr;
+  if (devPtr) *devPtr = nullptr;
+  return ret;
 }
 
 template <typename T>

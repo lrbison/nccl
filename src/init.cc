@@ -729,11 +729,16 @@ static ncclResult_t devCommSetup(ncclComm_t comm) {
 
   if (ncclGdrCopy != NULL && ncclParamGdrCopyFifoEnable() == 1 && comm->workFifoBytes > 0) {
     // The workFifoBuf lives in GDR mapped CUDA memory.
-    NCCLCHECKGOTO(ncclGdrCudaCalloc(&comm->workFifoBuf, &comm->workFifoBufDev, comm->workFifoBytes,
-                                    &comm->workFifoBufGdrHandle, comm->memManager),
-                  ret, fail);
-    ncclCommPushCudaGdrFree(comm, comm->workFifoBufGdrHandle);
-  } else {
+    ret = ncclGdrCudaCalloc(&comm->workFifoBuf, &comm->workFifoBufDev, comm->workFifoBytes,
+                            &comm->workFifoBufGdrHandle, comm->memManager);
+    if (ret == ncclSuccess) {
+      ncclCommPushCudaGdrFree(comm, comm->workFifoBufGdrHandle);
+    } else {
+      INFO(NCCL_INIT, "GDRCOPY work FIFO setup failed, falling back to host memory");
+      ret = ncclSuccess;
+    }
+  }
+  if (comm->workFifoBuf == nullptr) {
     // The workFifoBuf lives in cudaHost memory.
     comm->workFifoBufGdrHandle = nullptr;
     NCCLCHECKGOTO(ncclCudaHostCalloc(&comm->workFifoBuf, comm->workFifoBytes), ret, fail);
