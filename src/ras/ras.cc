@@ -169,7 +169,7 @@ ncclResult_t ncclRasCommFini(const struct ncclComm* comm) {
       }
     }
   }
-  if (ncclAtomicRefCountDecrement(&rasInitRefCount) == 0) rasTerminate();
+  ncclAtomicRefCountDecrement(&rasInitRefCount);
   return ncclSuccess;
 }
 
