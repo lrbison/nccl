@@ -100,7 +100,8 @@ static ncclResult_t ncclReshapeLeaderConnStart(struct ncclReshapeLeaderState* st
   if (state == NULL || state->joiners == NULL || sock == NULL || connOut == NULL) return ncclInvalidArgument;
   *connOut = NULL;
   conn = state->joiners + rank;
-  if (!COMPILER_ATOMIC_COMPARE_EXCHANGE(&conn->joinStatus, &expected, ncclJoinPeerStatusPeerConnecting,
+  if (!COMPILER_ATOMIC_COMPARE_EXCHANGE(&conn->joinStatus, &expected,
+                                        static_cast<int>(ncclJoinPeerStatusPeerConnecting),
                                         std::memory_order_acq_rel, std::memory_order_acquire)) {
     return ncclSuccess;
   }
@@ -138,7 +139,7 @@ ncclResult_t ncclReshapeLeaderStateDestroy(ncclComm_t comm) {
   struct ncclReshapeLeaderState* state = comm ? comm->reshapeLeader : NULL;
 
   if (state == NULL) return ncclSuccess;
-  COMPILER_ATOMIC_STORE(&state->threadStop, 1, std::memory_order_release);
+  COMPILER_ATOMIC_STORE(&state->threadStop, uint32_t(1), std::memory_order_release);
   if (state->thread != NULL && state->thread->joinable()) state->thread->join();
   while (COMPILER_ATOMIC_LOAD(&state->peerThreadCount, std::memory_order_acquire) != 0) {
     std::this_thread::sleep_for(std::chrono::microseconds(1));
@@ -589,7 +590,7 @@ ncclResult_t bootstrapReshapeCreateRoot(struct ncclBootstrapHandle* handle, nccl
     delete state->thread;
     state->thread = NULL;
   }
-  COMPILER_ATOMIC_STORE(&state->threadStop, 0, std::memory_order_release);
+  COMPILER_ATOMIC_STORE(&state->threadStop, uint32_t(0), std::memory_order_release);
   COMPILER_ATOMIC_STORE(&state->threadResult, ncclInProgress, std::memory_order_release);
 
   NCCLCHECKGOTO(ncclCalloc(&listenSock, 1), ret, fail);
@@ -717,7 +718,7 @@ static ncclResult_t bootstrapReshapeLeaderWaitForCommit(ncclComm_t comm, struct 
     res = ncclRemoteError;
     goto fail;
   }
-  COMPILER_ATOMIC_STORE(&conn->joinStatus, ncclJoinPeerStatusPeerReady, std::memory_order_release);
+  COMPILER_ATOMIC_STORE(&conn->joinStatus, static_cast<int>(ncclJoinPeerStatusPeerReady), std::memory_order_release);
 
   while (COMPILER_ATOMIC_LOAD(&state->threadStop, std::memory_order_acquire) == 0 &&
          COMPILER_ATOMIC_LOAD(comm->abortFlag, std::memory_order_acquire) == 0) {
@@ -738,7 +739,7 @@ static ncclResult_t bootstrapReshapeLeaderWaitForCommit(ncclComm_t comm, struct 
 
 exit:
   (void)ncclSocketClose(&conn->sock);
-  COMPILER_ATOMIC_STORE(&conn->joinStatus, ncclJoinPeerStatusUninit, std::memory_order_release);
+  COMPILER_ATOMIC_STORE(&conn->joinStatus, static_cast<int>(ncclJoinPeerStatusUninit), std::memory_order_release);
   return res;
 fail:
   if (res == ncclSuccess) res = ncclInternalError;
@@ -820,7 +821,7 @@ static void bootstrapReshapeLeaderAcceptPeer(void* rargs) {
 fail:
   if (conn != NULL) {
     (void)ncclSocketClose(&conn->sock);
-    COMPILER_ATOMIC_STORE(&conn->joinStatus, ncclJoinPeerStatusUninit, std::memory_order_release);
+    COMPILER_ATOMIC_STORE(&conn->joinStatus, static_cast<int>(ncclJoinPeerStatusUninit), std::memory_order_release);
   } else if (sock != NULL) {
     (void)ncclSocketClose(sock);
     free(sock);
@@ -880,14 +881,16 @@ static ncclResult_t bootstrapReshapeLeaderSignalJoiners(struct ncclReshapeLeader
     struct ncclReshapeJoinerConn* conn = state->joiners + rank;
     if (result == ncclSuccess) {
       int expected = ncclJoinPeerStatusPeerReady;
-      if (!COMPILER_ATOMIC_COMPARE_EXCHANGE(&conn->joinStatus, &expected, ncclJoinPeerStatusLeaderCommitted,
+      if (!COMPILER_ATOMIC_COMPARE_EXCHANGE(&conn->joinStatus, &expected,
+                                            static_cast<int>(ncclJoinPeerStatusLeaderCommitted),
                                             std::memory_order_acq_rel, std::memory_order_acquire)) {
         WARN("bootstrapReshapeLeaderSignalJoiners: joiner rank %d status %d was not ready to commit", rank, expected);
         if (res == ncclSuccess) res = ncclRemoteError;
       }
     } else {
       if (COMPILER_ATOMIC_LOAD(&conn->joinStatus, std::memory_order_acquire) != ncclJoinPeerStatusUninit) {
-        COMPILER_ATOMIC_STORE(&conn->joinStatus, ncclJoinPeerStatusLeaderCanceled, std::memory_order_release);
+        COMPILER_ATOMIC_STORE(&conn->joinStatus, static_cast<int>(ncclJoinPeerStatusLeaderCanceled),
+                              std::memory_order_release);
         (void)ncclSocketClose(&conn->sock);
       }
     }
