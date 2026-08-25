@@ -84,6 +84,7 @@ static ncclResult_t rasNetSendNack(struct rasSocket* sock);
 
 static void* rasThreadMain(void*);
 
+static ncclResult_t rasTerminateInternal();
 static void rasTerminate();
 
 // enable to run passive RAS diagnostics
@@ -159,28 +160,40 @@ fail:
 // Invoked by regular NCCL threads on every comm termination.
 ncclResult_t ncclRasCommFini(const struct ncclComm* comm) {
   if (!rasInitialized) return ncclSuccess;
+  bool found = false;
   {
     std::lock_guard<std::mutex> lock(ncclCommsMutex);
     for (int i = 0; i < nNcclComms; i++) {
       if (ncclComms[i] == comm) {
         ncclComms[i] = nullptr;
         ncclCommsSorted = false;
+        found = true;
         break;
       }
     }
   }
-  ncclAtomicRefCountDecrement(&rasInitRefCount);
+  if (found) ncclAtomicRefCountDecrement(&rasInitRefCount);
   return ncclSuccess;
 }
 
-// Global destructor.  Notifies the RAS thread to release all the resources
-// and terminate.  Waits for the thread to terminate.
-static void rasTerminate() {
+ncclResult_t ncclRasQuiesce(void) {
+  return rasTerminateInternal();
+}
+
+// Notifies the RAS thread to release all the resources and terminate.  Waits for the thread to terminate.
+static ncclResult_t rasTerminateInternal() {
   struct rasNotification msg;
-  if (!rasInitialized) return;
+  if (!rasInitialized) return ncclSuccess;
   memset(&msg, '\0', sizeof(msg));
   msg.type = RAS_TERMINATE;
-  if (rasLocalNotify(&msg) == ncclSuccess) rasThread.join();
+  NCCLCHECK(rasLocalNotify(&msg));
+  rasThread.join();
+  return ncclSuccess;
+}
+
+// Global destructor.
+static void rasTerminate() {
+  (void)rasTerminateInternal();
 }
 
 // Invoked by regular NCCL threads on every (non-split) comm initialization.  Provides info on all the ranks within

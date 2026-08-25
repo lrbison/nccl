@@ -3887,7 +3887,9 @@ ncclResult_t ncclCommMaskCountActive(ncclComm_t comm, int* count) {
 NCCL_API(ncclResult_t, ncclNetQuiesce);
 ncclResult_t ncclNetQuiesce() {
   NCCL_NVTX3_FUNC_RANGE;
-  return ncclNetQuiesceInternal();
+  ncclResult_t res = ncclNetQuiesceInternal();
+  ncclResult_t rasRes = ncclRasQuiesce();
+  return res == ncclSuccess ? rasRes : res;
 }
 
 NCCL_API(ncclResult_t, ncclCommRediscoverDevices, ncclComm_t comm);

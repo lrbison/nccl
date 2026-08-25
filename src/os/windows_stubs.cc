@@ -57,6 +57,10 @@ ncclResult_t ncclRasCommFini(const struct ncclComm* comm) {
   return ncclSuccess;
 }
 
+ncclResult_t ncclRasQuiesce(void) {
+  return ncclSuccess;
+}
+
 /* --------------------------------------------------------------------------
  * Net plugin stubs: use built-in socket transport without plugin layer
  * -------------------------------------------------------------------------- */
