@@ -369,7 +369,14 @@ static ncclResult_t ncclGinDevCommCreateContexts(struct ncclComm* comm, struct n
   int nContextsTotal = ginStateDevComm->devContextCount;
 
   if (!ginState->connected || backend->ginCommCount <= 0) return ncclInternalError;
-  if (ginStateDevComm->backendVersion < 13) {
+  bool legacyBackendContextModel = ginStateDevComm->backendVersion < 13;
+  if (legacyBackendContextModel && backend->ginVersion >= 13) {
+    WARN("GIN devComm context diagnostic: plugin api version %d but GPU context layout version %d selected legacy path "
+         "(requested contexts %d, connections %d, deferred %d)",
+         backend->ginVersion, ginStateDevComm->backendVersion, ginStateDevComm->devContextCount, backend->ginCommCount,
+         ginStateDevComm->deferred ? 1 : 0);
+  }
+  if (legacyBackendContextModel) {
     if (ginStateDevComm->deferred) {
       WARN("Deferred GIN devComm setup requires a GIN plugin with backend version 13 or newer.");
       return ncclInvalidUsage;
@@ -378,7 +385,7 @@ static ncclResult_t ncclGinDevCommCreateContexts(struct ncclComm* comm, struct n
   }
   if (devComm != NULL) {
     devComm->ginContextCount =
-      ginStateDevComm->backendVersion < 13 ? backend->ginCommCount : ginStateDevComm->devContextCount;
+      legacyBackendContextModel ? backend->ginCommCount : ginStateDevComm->devContextCount;
   }
 
   nContextsTotal = ROUNDUP(nContextsTotal, backend->ginCommCount);
