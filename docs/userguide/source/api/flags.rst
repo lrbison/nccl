@@ -67,3 +67,63 @@ These flags modify the behavior of the ``ncclCommShrink`` operation.
    This is used for error recovery scenarios where the parent communicator might be in a hung state.
    Resources of parent comm are still not freed, users should decide whether to call ncclCommAbort on the parent communicator after shrink.
    Value: ``0x01``.
+
+.. _unique_id_flags:
+
+Communicator Unique ID Flags
+----------------------------
+
+These flags modify the behavior of :c:func:`ncclCommGetUniqueId_v2`.
+
+.. c:macro:: NCCL_UNIQUE_ID_DEFAULT
+
+   Generate a communicator-scoped unique ID with the same behavior as
+   :c:func:`ncclCommGetUniqueId`.
+   Value: ``0``.
+
+.. c:macro:: NCCL_UNIQUE_ID_RESHAPE
+
+   Create or return the reshape unique ID for the calling rank on a communicator.
+   Applications distribute this ID to replacement or restored ranks before those
+   ranks initialize with :c:func:`ncclCommInitRank` or
+   :c:func:`ncclCommInitRankConfig`.
+   Value: ``1``.
+
+.. _comm_reshape_flags:
+
+Communicator Reshape Flags
+--------------------------
+
+These flags modify the behavior of :c:func:`ncclCommReshape`.
+
+.. c:macro:: NCCL_COMM_RESHAPE_DEFAULT
+
+   Perform a collective in-place reshape, or signal joiner readiness when called
+   on a communicator initialized with a reshape unique ID.
+   Value: ``0``.
+
+.. c:macro:: NCCL_COMM_RESHAPE_LOCAL_ONLY
+
+   Locally remove rank slots from the communicator's active mask without
+   collective communication. This mode cannot add or reactivate rank slots and
+   cannot remove the local rank.
+   Value: ``1``.
+
+.. _comm_init_flags:
+
+Communicator Initialization Flags
+---------------------------------
+
+These flags can be set in :c:macro:`commInitFlags` in :c:type:`ncclConfig_t`.
+
+.. c:macro:: NCCL_COMM_INIT_DEFAULT
+
+   Default communicator initialization behavior.
+   Value: ``0``.
+
+.. c:macro:: NCCL_COMM_INIT_REUSE_EXISTING
+
+   Reuse and refresh the existing communicator pointed to by the ``ncclComm_t*``
+   argument to :c:func:`ncclCommInitRankConfig`. This flag is only valid when
+   initializing with a reshape unique ID.
+   Value: ``1``.

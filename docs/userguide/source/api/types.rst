@@ -57,6 +57,13 @@ ncclResult_t
    (``7``)
    A NCCL operation on the communicator is being enqueued and is being progressed in the background.
 
+ .. c:macro:: ncclResourceNotReady
+
+   (``9``)
+   A requested operation depends on a resource that is not ready yet. For example,
+   :c:func:`ncclCommReshape` returns this when a required joiner has not signaled
+   readiness; the operation can be retried.
+
  Whenever a function returns an error (neither ncclSuccess nor ncclInProgress), NCCL should print a more detailed message when the environment variable :ref:`NCCL_DEBUG` is set to "WARN".
 
 ncclDataType_t
@@ -180,6 +187,22 @@ ncclScalarResidence_t
 
   The scalar resides on device visible memory and should be dereferenced once
   needed.
+
+ncclCommMaskValue_t
+-------------------
+
+.. c:type:: ncclCommMaskValue_t
+
+ Values returned by :c:func:`ncclCommMaskGet` for each rank slot in an in-place
+ reshaped communicator.
+
+ .. c:macro:: ncclRankMaskInactive
+
+  The rank slot is inactive.
+
+ .. c:macro:: ncclRankMaskActive
+
+  The rank slot is active.
 
 .. _ncclconfig:
 
@@ -430,6 +453,16 @@ ncclConfig_t
   The component flags can be combined with the bitwise OR operator. These flags
   do not affect the communicator's reported Device API multimem capability and
   do not prevent explicit Device API calls from allocating multimem resources.
+
+ .. c:macro:: commInitFlags
+
+  Additional communicator initialization flags. The default value is
+  :c:macro:`NCCL_COMM_INIT_DEFAULT`.
+
+  :c:macro:`NCCL_COMM_INIT_REUSE_EXISTING` is valid only when initializing with a
+  reshape unique ID. In this mode, the ``ncclComm_t*`` argument to
+  :c:func:`ncclCommInitRankConfig` is used as an in/out parameter and must point
+  to an existing communicator that NCCL refreshes in place.
 
 .. _ncclcollconfig:
 

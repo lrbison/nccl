@@ -134,6 +134,21 @@ The coordinator is responsible for distributing the *uniqueId* to all new ranks
 before they join the communicator via *ncclCommGrow*. This function should only
 be called when there are no outstanding NCCL operations on the communicator.
 
+ncclCommGetUniqueId_v2
+----------------------
+
+.. c:function:: ncclResult_t ncclCommGetUniqueId_v2(ncclComm_t comm, ncclUniqueId* uniqueId, int flags)
+
+Generates a communicator-scoped unique identifier. With
+:c:macro:`NCCL_UNIQUE_ID_DEFAULT`, this function has the same behavior as
+:c:func:`ncclCommGetUniqueId`.
+
+With :c:macro:`NCCL_UNIQUE_ID_RESHAPE`, this function creates or returns the
+reshape unique identifier for the calling rank on *comm*. A reshape unique ID is
+distributed by the application to replacement or restored ranks using an
+out-of-band mechanism, then passed to :c:func:`ncclCommInitRank` or
+:c:func:`ncclCommInitRankConfig` by those joiners. See :ref:`reshape`.
+
 ncclCommGrow
 ------------
 
@@ -167,6 +182,70 @@ After the grow operation completes, the parent communicator should be destroyed 
 2. Coordinator distributes the *uniqueId* to all new ranks (out-of-band)
 3. All existing ranks call *ncclCommGrow* with *comm*\=parent, *rank*\=-1, *uniqueId*\=NULL (except for Coordinator rank which passes the *uniqueId*)
 4. All new ranks call *ncclCommGrow* with *comm*\=NULL, *rank*\=new_rank, *uniqueId*\=received_id
+
+ncclCommReshape
+---------------
+
+.. c:function:: ncclResult_t ncclCommReshape(ncclComm_t comm, int leaderRank, const int* joinList, int joinListLen, const int* leaveList, int leaveListLen, int flags)
+
+Changes the active rank slots of *comm* in-place without changing the
+communicator object or renumbering rank slots. The *joinList* and *leaveList*
+arrays contain rank slots in the original communicator. A rank slot can appear
+in both lists to express same-slot replacement by a live leaving rank and a
+warmed joiner for that slot. :c:func:`ncclCommCount` continues to report the
+original rank count; use
+:c:func:`ncclCommMaskCountActive` to query the current active count.
+
+With :c:macro:`NCCL_COMM_RESHAPE_DEFAULT`, reshape is a collective membership
+transition. Active ranks that remain active, and live ranks named in
+*leaveList*, call this function with matching arguments. *leaderRank* names the
+active rank that owns the reshape unique ID used by joiners. The leader rank
+cannot be removed by the same reshape. If a required joiner is not ready, this
+function returns :c:macro:`ncclResourceNotReady` and leaves the committed active
+mask unchanged, so the application can retry the same reshape later.
+
+With :c:macro:`NCCL_COMM_RESHAPE_LOCAL_ONLY`, reshape performs only a local
+remove from the active mask. This mode performs no collective communication,
+cannot add or reactivate ranks, and cannot remove the local rank. It is intended
+for failure handling and checkpoint prepare paths where removed peers may be
+unreachable.
+
+If *comm* was initialized with a reshape unique ID, :c:func:`ncclCommReshape`
+is the joiner ready-and-wait operation. In this role, *joinList* and
+*leaveList* must be NULL, their lengths must be 0, and *flags* must be
+:c:macro:`NCCL_COMM_RESHAPE_DEFAULT`. Blocking and nonblocking behavior follows
+the communicator's configured blocking mode. A pending joiner can be canceled by
+aborting the communicator with :c:func:`ncclCommAbort`.
+
+There should be no outstanding NCCL operations on *comm* when calling reshape.
+Normal full-communicator collectives are not supported while the communicator is
+partially masked unless a specific mask-aware algorithm is selected. See
+:ref:`reshape`.
+
+ncclCommRediscoverDevices
+-------------------------
+
+.. c:function:: ncclResult_t ncclCommRediscoverDevices(ncclComm_t comm)
+
+Refreshes local bootstrap and network device discovery for *comm*. This is a
+restore helper for applications that checkpointed after masking communicators to
+the local rank only, then restored on hardware or network addresses that may
+differ from the original process.
+
+This call is valid when the local rank is the only active rank in the
+communicator and the communicator owns its resources. It does not reconnect
+remote ranks by itself; applications use reshape to reconnect or replace ranks
+after rediscovery.
+
+ncclNetQuiesce
+--------------
+
+.. c:function:: ncclResult_t ncclNetQuiesce(void)
+
+Releases process-local network provider and RAS resources after all NCCL
+communicators in the process have been quiesced. This is a process-wide helper
+for checkpoint prepare paths and is not implicitly triggered by one
+communicator's reshape.
 
 ncclCommRevoke
 --------------
@@ -241,6 +320,25 @@ ncclCommCount
 .. c:function:: ncclResult_t ncclCommCount(const ncclComm_t comm, int* count)
 
 Returns in *count* the number of ranks in the NCCL communicator *comm*.
+For an in-place reshaped communicator, this is the original communicator rank
+count, not the number of active rank slots.
+
+ncclCommMaskGet
+---------------
+
+.. c:function:: ncclResult_t ncclCommMaskGet(ncclComm_t comm, ncclCommMaskValue_t* mask)
+
+Copies the active rank mask for *comm* into the user-provided *mask* array. The
+array must have space for at least :c:func:`ncclCommCount` entries. Each entry is
+either :c:macro:`ncclRankMaskActive` or :c:macro:`ncclRankMaskInactive`.
+
+ncclCommMaskCountActive
+-----------------------
+
+.. c:function:: ncclResult_t ncclCommMaskCountActive(ncclComm_t comm, int* count)
+
+Counts active rank slots in *comm* and returns the value in *count*. This count
+is derived from the communicator's active mask.
 
 ncclCommCuDevice
 ----------------
