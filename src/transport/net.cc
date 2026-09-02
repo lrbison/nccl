@@ -725,8 +725,15 @@ static ncclResult_t sharedNetBuffersDestroy(struct ncclProxyState* proxyState, i
         NCCLCHECK(ncclP2pFreeShareableBuffer(&state->ipcDesc));
       }
       NCCLCHECK(ncclCudaFree(state->cudaBuff, proxyState->memManager));
+      state->cudaBuff = NULL;
+      memset(&state->ipcDesc, 0, sizeof(state->ipcDesc));
     }
-    if (state->hostBuff) NCCLCHECK(ncclCudaHostFree(state->hostBuff));
+    if (state->hostBuff) {
+      NCCLCHECK(ncclCudaHostFree(state->hostBuff));
+      state->hostBuff = NULL;
+    }
+    state->size = 0;
+    memset(state->proxyAppend, 0, sizeof(state->proxyAppend));
   }
 
   if (peer->send.refcount || peer->recv.refcount) return ncclSuccess;

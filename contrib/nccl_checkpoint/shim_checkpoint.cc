@@ -108,6 +108,17 @@ static ncclResult_t maskCommToSelf(CommRecord* record) {
   return ncclSuccess;
 }
 
+static ncclResult_t quiesceComm(const CommRecord& record) {
+  using quiesce_t = ncclResult_t (*)(ncclComm_t);
+  static quiesce_t real_ncclCommQuiesce = nullptr;
+  NCCLCHECK(resolveRealFunction("ncclCommQuiesce", &real_ncclCommQuiesce));
+
+  INFO(NCCL_CHECKPOINT, "prepare quiesce comm %p rank=%d/%d hash=0x%016llx", record.comm, record.rank,
+       record.nranks, (unsigned long long)record.commHash);
+  NCCLCHECK(real_ncclCommQuiesce(record.comm));
+  return ncclSuccess;
+}
+
 static ncclResult_t quiesceNet(void) {
   using quiesce_t = ncclResult_t (*)();
   static quiesce_t real_ncclNetQuiesce = nullptr;
@@ -275,6 +286,8 @@ extern "C" ncclResult_t ncclCheckpointPrepare(void) {
       if (ret != ncclSuccess) break;
     }
     ret = maskCommToSelf(&record);
+    if (ret != ncclSuccess) break;
+    ret = quiesceComm(record);
     if (ret != ncclSuccess) break;
   }
 

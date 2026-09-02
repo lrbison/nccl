@@ -363,6 +363,10 @@ ncclResult_t pncclCommMaskCountActive(ncclComm_t comm, int* count);
 ncclResult_t  ncclCommRediscoverDevices(ncclComm_t comm);
 ncclResult_t pncclCommRediscoverDevices(ncclComm_t comm);
 
+/* Release communicator-local proxy and bootstrap resources before checkpoint. */
+ncclResult_t  ncclCommQuiesce(ncclComm_t comm);
+ncclResult_t pncclCommQuiesce(ncclComm_t comm);
+
 /* Release process-local network provider resources after communicators have been quiesced. */
 ncclResult_t  ncclNetQuiesce(void);
 ncclResult_t pncclNetQuiesce(void);

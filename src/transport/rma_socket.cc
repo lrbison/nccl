@@ -17,6 +17,7 @@
 
 static int ncclRmaSocketProxyRefCount;
 static std::mutex ncclRmaSocketProxyMutex;
+extern int64_t ncclParamGdrCopyEnable();
 
 ncclResult_t ncclRmaSocketProxyInit(void** ctx, uint64_t commId, ncclDebugLogger_t logFunction) {
   (void)commId;
@@ -26,6 +27,10 @@ ncclResult_t ncclRmaSocketProxyInit(void** ctx, uint64_t commId, ncclDebugLogger
   if (ncclRmaSocketProxyRefCount) {
     ncclRmaSocketProxyRefCount++;
     return ncclSuccess;
+  }
+  if (ncclParamGdrCopyEnable() == 0) {
+    INFO(NCCL_INIT, "RMA/Socket : disabled because NCCL_GDRCOPY_ENABLE=0");
+    return ncclInternalError;
   }
   if (ncclGdrCopy == NULL) ncclGdrCopy = ncclGdrInit();
   if (ncclGdrCopy == NULL) {

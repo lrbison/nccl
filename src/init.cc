@@ -3892,6 +3892,75 @@ ncclResult_t ncclNetQuiesce() {
   return res == ncclSuccess ? rasRes : res;
 }
 
+NCCL_API(ncclResult_t, ncclCommQuiesce, ncclComm_t comm);
+ncclResult_t ncclCommQuiesce(ncclComm_t comm) {
+  NCCL_NVTX3_FUNC_RANGE;
+  ncclResult_t res = ncclSuccess;
+  int activeCount = 0;
+
+  NCCLCHECKGOTO(CommCheck(comm, __func__, "comm"), res, exit);
+  if (comm->destroyFlag || comm->finalizeCalled) {
+    WARN("ncclCommQuiesce: communicator is already being destroyed or finalized");
+    res = ncclInvalidArgument;
+    goto exit;
+  }
+  NCCLCHECKGOTO(ncclCommEnsureReady(comm), res, exit);
+  if (comm->bootstrap == NULL) {
+    WARN("ncclCommQuiesce: communicator is missing initialized bootstrap state");
+    res = ncclInvalidUsage;
+    goto exit;
+  }
+  activeCount = ncclCommCountActiveRanks(comm);
+  if (activeCount != 1 || !ncclCommIsRankActive(comm, comm->rank)) {
+    WARN("ncclCommQuiesce: comm must be masked to local rank only, active count %d rank %d", activeCount, comm->rank);
+    res = ncclInvalidUsage;
+    goto exit;
+  }
+  if (comm->sharedRes == NULL || comm->sharedRes->owner != comm) {
+    WARN("ncclCommQuiesce: shared communicator quiesce is not supported");
+    res = ncclInvalidUsage;
+    goto exit;
+  }
+
+  CUDACHECKGOTO(cudaSetDevice(comm->cudaDev), res, exit);
+  NCCLCHECKGOTO(ncclStrongStreamSynchronize(&comm->sharedRes->hostStream), res, exit);
+  NCCLCHECKGOTO(ncclStrongStreamSynchronize(&comm->sharedRes->deviceStream), res, exit);
+  NCCLCHECKGOTO(ncclCommPollEventCallbacks(comm, /*waitSome=*/true), res, exit);
+  NCCLCHECKGOTO(ncclCommPollCallbacks(comm, /*waitSome=*/false), res, exit);
+  NCCLCHECKGOTO(ncclDevrQuiesceGin(comm), res, exit);
+  if (comm->proxyState != comm->sharedRes->proxyState) {
+    WARN("ncclCommQuiesce: proxy state is inconsistent");
+    res = ncclInternalError;
+    goto exit;
+  }
+  if (comm->proxyState != NULL) {
+    if (comm->proxyState->refCount != 1) {
+      WARN("ncclCommQuiesce: proxy refcount %d is not quiesceable", comm->proxyState->refCount);
+      res = ncclInvalidUsage;
+      goto exit;
+    }
+    NCCLCHECKGOTO(ncclProxyStop(comm), res, exit);
+    if (comm->proxyRefCountOld == 0) {
+      if (comm->proxyState->thread.joinable()) {
+        comm->proxyState->thread.join();
+      }
+      if (comm->proxyState->threadUDS.joinable()) {
+        comm->proxyState->threadUDS.join();
+      }
+    }
+    NCCLCHECKGOTO(ncclProxyDestroy(comm), res, exit);
+    comm->sharedRes->proxyState = NULL;
+    comm->proxyState = NULL;
+    comm->proxyRefCountOld = 0;
+  }
+  NCCLCHECKGOTO(bootstrapQuiesceLocalAddresses(comm), res, exit);
+
+  INFO(NCCL_INIT, "comm %p rank %d nRanks %d - CommQuiesce COMPLETE", comm, comm->rank, comm->nRanks);
+
+exit:
+  return res;
+}
+
 NCCL_API(ncclResult_t, ncclCommRediscoverDevices, ncclComm_t comm);
 ncclResult_t ncclCommRediscoverDevices(ncclComm_t comm) {
   NCCL_NVTX3_FUNC_RANGE;
