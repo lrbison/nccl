@@ -705,6 +705,7 @@ void ncclGinIbGdakiResetDevices();
 ncclResult_t ncclIbGdrSupport();
 ncclResult_t ncclIbPeerMemSupport();
 ncclResult_t ncclIbDmaBufSupport(int dev);
+ncclResult_t ncclIbDmaBufSupportReset();
 
 void ncclIbAddEvent(struct ncclIbRequest* req, int devIndex);
 ncclResult_t ncclIbGetGidIndex(struct ibv_context* context, uint8_t portNum, struct ibv_port_attr* portAttr,

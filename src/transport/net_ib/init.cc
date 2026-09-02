@@ -455,6 +455,7 @@ static void ncclIbResetDevices(void) {
   for (int d = 0; d < ncclNIbDevs; d++) {
     ncclIbResetDeviceState(d);
   }
+  ncclIbDmaBufSupportReset();
   memset(ncclIbMergedDevs, 0, sizeof(ncclIbMergedDevs));
   ncclNIbDevs = -1;
   ncclNMergedIbDevs = -1;

@@ -42,13 +42,19 @@ ncclResult_t ncclIbPeerMemSupport() {
   return ncclSuccess;
 }
 
-static thread_local int ibDmaSupportInitDev; // which device to init, must be thread local
-static void ibDmaBufSupportInitOnce() {
+static bool ibDmaBufSupportChecked[MAX_IB_DEVS];
+
+ncclResult_t ncclIbDmaBufSupportReset() {
+  memset(ibDmaBufSupportChecked, 0, sizeof(ibDmaBufSupportChecked));
+  return ncclSuccess;
+}
+
+static void ibDmaBufSupportInit(int dev) {
   ncclResult_t res;
   int dev_fail = 0;
 
-  // This is a physical device, not a virtual one, so select from ibDevs
-  ncclIbMergedDev* mergedDev = ncclIbMergedDevs + ibDmaSupportInitDev;
+  // Test an underlying physical device and cache the result on ncclIbDevs.
+  ncclIbMergedDev* mergedDev = ncclIbMergedDevs + dev;
   ncclIbDev* ibDev = ncclIbDevs + mergedDev->vProps.devs[0];
   struct ibv_pd* pd;
   struct ibv_context* ctx = ibDev->context;
@@ -71,12 +77,12 @@ failure:
 // ncclSuccess : DMA-BUF support is available
 // ncclSystemError : DMA-BUF is not supported by the kernel
 ncclResult_t ncclIbDmaBufSupport(int dev) {
-  static std::once_flag onces[MAX_IB_DEVS];
-  // init the device only once
-  ibDmaSupportInitDev = dev;
-  std::call_once(onces[dev], ibDmaBufSupportInitOnce);
-  ncclIbMergedDev* mergedDev = ncclIbMergedDevs + ibDmaSupportInitDev;
+  ncclIbMergedDev* mergedDev = ncclIbMergedDevs + dev;
   ncclIbDev* ibDev = ncclIbDevs + mergedDev->vProps.devs[0];
+  if (!ibDmaBufSupportChecked[dev]) {
+    ibDmaBufSupportInit(dev);
+    ibDmaBufSupportChecked[dev] = true;
+  }
   int dmaBufSupported = ibDev->dmaBufSupported;
   if (dmaBufSupported == 1) return ncclSuccess;
   return ncclSystemError;
