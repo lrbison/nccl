@@ -1377,6 +1377,35 @@ static ncclResult_t bootstrapCloseRing(struct bootstrapState* state) {
   return ncclSuccess;
 }
 
+ncclResult_t bootstrapQuiesceLocalAddresses(struct ncclComm* comm) {
+  struct bootstrapState* state = comm ? (struct bootstrapState*)comm->bootstrap : NULL;
+  int activeCount = comm ? ncclRankMaskCountActive(comm->activeRankMask, comm->nRanks) : 0;
+
+  if (comm == NULL || state == NULL) return ncclInvalidArgument;
+  if (activeCount != 1 || !ncclRankMaskIsActive(comm->activeRankMask, comm->nRanks, comm->rank)) {
+    WARN("bootstrapQuiesceLocalAddresses: comm must be masked to local rank only, active count %d rank %d",
+         activeCount, comm->rank);
+    return ncclInvalidUsage;
+  }
+  if (comm->proxyState != NULL || (comm->sharedRes != NULL && comm->sharedRes->proxyState != NULL)) {
+    WARN("bootstrapQuiesceLocalAddresses: proxy state must be quiesced first");
+    return ncclInvalidUsage;
+  }
+  NCCLCHECK(bootstrapCloseRing(state));
+  if (ncclParamBootstrapNetEnable()) {
+    if (STATE_LISTEN(state, net.comm) != NULL) {
+      NCCLCHECK(state->net->closeListen(STATE_LISTEN(state, net.comm)));
+      STATE_LISTEN(state, net.comm) = NULL;
+    }
+  } else {
+    NCCLCHECK(ncclSocketClose(&STATE_LISTEN(state, socket)));
+  }
+  NCCLCHECK(ncclSocketClose(&STATE_LISTEN(state, peerSocket)));
+
+  INFO(NCCL_INIT, "comm %p rank %d nRanks %d - BootstrapQuiesce COMPLETE", comm, comm->rank, comm->nRanks);
+  return ncclSuccess;
+}
+
 ncclResult_t bootstrapRediscoverLocalAddresses(struct ncclComm* comm) {
   ncclResult_t result = ncclSuccess;
   struct bootstrapState* state = comm ? (struct bootstrapState*)comm->bootstrap : NULL;
@@ -1397,10 +1426,9 @@ ncclResult_t bootstrapRediscoverLocalAddresses(struct ncclComm* comm) {
          activeCount, rank);
     return ncclInvalidUsage;
   }
-  if (comm->sharedRes == NULL || comm->sharedRes->owner != comm ||
-      (comm->proxyState != NULL && comm->proxyState != comm->sharedRes->proxyState) ||
-      (comm->proxyState != NULL && comm->proxyState->refCount != 1)) {
-    WARN("bootstrapRediscoverLocalAddresses: shared proxy state is not restartable");
+  if (comm->sharedRes == NULL || comm->sharedRes->owner != comm || comm->proxyState != NULL ||
+      comm->sharedRes->proxyState != NULL) {
+    WARN("bootstrapRediscoverLocalAddresses: proxy state must be quiesced before rediscovery");
     return ncclInvalidUsage;
   }
   if (state->ringAddresses == NULL || state->peerP2pAddresses == NULL || state->peerProxyAddresses == NULL ||
@@ -1455,14 +1483,17 @@ ncclResult_t bootstrapRediscoverLocalAddresses(struct ncclComm* comm) {
 
   oldPeerProxyAddresses = state->peerProxyAddresses;
   oldPeerProxyAddressesUDS = state->peerProxyAddressesUDS;
-  NCCLCHECKGOTO(ncclProxyRestart(comm, proxySocket, newPeerProxyAddresses, newPeerProxyAddressesUDS), result, fail);
+  NCCLCHECKGOTO(ncclProxyInit(comm, proxySocket, newPeerProxyAddresses, newPeerProxyAddressesUDS), result, fail);
   state->peerProxyAddresses = newPeerProxyAddresses;
   state->peerProxyAddressesUDS = newPeerProxyAddressesUDS;
   proxySocket = NULL;
   newPeerProxyAddresses = NULL;
   newPeerProxyAddressesUDS = NULL;
   free(oldPeerProxyAddresses);
+  oldPeerProxyAddresses = NULL;
   free(oldPeerProxyAddressesUDS);
+  oldPeerProxyAddressesUDS = NULL;
+  NCCLCHECKGOTO(ncclProxyCreate(comm), result, fail);
 
   if (state->rasRanks != NULL) {
     memcpy(&state->rasRanks[rank].addr, &bootstrapNetIfAddr, sizeof(state->rasRanks[rank].addr));
@@ -2504,7 +2535,8 @@ ncclResult_t bootstrapClose(void* commState) {
   // close the p2p socket
   NCCLCHECK(ncclSocketClose(&STATE_LISTEN(state, peerSocket)));
 
-  // proxy things are free'd elsewhere
+  free(state->peerProxyAddresses);
+  free(state->peerProxyAddressesUDS);
   free(state->ringAddresses);
   free(state->peerP2pAddresses);
   free(state->rasRanks);
@@ -2513,11 +2545,5 @@ ncclResult_t bootstrapClose(void* commState) {
 }
 
 ncclResult_t bootstrapAbort(void* commState) {
-  if (commState == NULL) return ncclSuccess;
-  struct bootstrapState* state = (struct bootstrapState*)commState;
-  // when aborting we need to close the proxy here (maybe?)
-  free(state->peerProxyAddresses);
-  free(state->peerProxyAddressesUDS);
-  NCCLCHECK(bootstrapClose(commState));
-  return ncclSuccess;
+  return bootstrapClose(commState);
 }

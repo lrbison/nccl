@@ -349,6 +349,7 @@ struct ncclProxyState {
   ncclResult_t asyncResult;
 
   // Used by main thread
+  // Bootstrap owns the address arrays; proxy state only borrows them.
   union ncclSocketAddress* peerAddresses;
   struct ncclSocket* peerSocks;
   struct ncclProxyOps* proxyOps;
@@ -416,8 +417,6 @@ ncclResult_t ncclProxyStart(struct ncclComm* comm);
 ncclResult_t ncclProxyInit(struct ncclComm* comm, struct ncclSocket* sock, union ncclSocketAddress* peerAddresses,
                            uint64_t* peerAddressesUDS);
 ncclResult_t ncclProxyCreate(struct ncclComm* comm);
-ncclResult_t ncclProxyRestart(struct ncclComm* comm, struct ncclSocket* sock, union ncclSocketAddress* peerAddresses,
-                              uint64_t* peerAddressesUDS);
 ncclResult_t ncclProxyConnect(struct ncclComm* comm, int transport, int send, int proxyRank,
                               struct ncclProxyConnector* proxyConn);
 

@@ -34,6 +34,7 @@ ncclResult_t bootstrapInit(int nHandles, void* handle, struct ncclComm* comm, st
 ncclResult_t bootstrapSplit(uint64_t magic, struct ncclComm* comm, struct ncclComm* parent, int color, int key,
                             int* parentRanks);
 ncclResult_t bootstrapJoinInitLocalState(struct ncclComm* comm);
+ncclResult_t bootstrapQuiesceLocalAddresses(struct ncclComm* comm);
 ncclResult_t bootstrapRediscoverLocalAddresses(struct ncclComm* comm);
 ncclResult_t bootstrapUpdateRankMask(void* commState);
 ncclResult_t bootstrapAllGather(void* commState, void* allData, int size);

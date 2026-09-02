@@ -1844,14 +1844,22 @@ void* ncclProxyService(void* _args) {
     /* Even if local comm aborts, we cannot let proxy thread exit if we still have peer
      * connections. Need to wait until all other related comms call abort and safely exit
      * together, or we could face segmentation fault. */
-    if (COMPILER_ATOMIC_LOAD(proxyState->abortFlag, std::memory_order_acquire) != 0) stop = PROXY_ABORT;
+    if (COMPILER_ATOMIC_LOAD(proxyState->abortFlag, std::memory_order_acquire) != 0) {
+      stop = PROXY_ABORT;
+    } else {
+      int stopRequest = COMPILER_ATOMIC_LOAD(&proxyState->stop, std::memory_order_acquire);
+      if (stopRequest != PROXY_RUNNING) stop = stopRequest;
+    }
+    if (stop != PROXY_RUNNING && npeers == 0) break;
     /* never let proxy service thread blocks in poll, or it cannot receive abortFlag. */
     int ret = 0;
     const int timeout = asyncOpCount ? 0 : 500;
     int nfds_to_poll = 0;
     pollfds[maxProxyConnections].revents = 0;
-    activePollSlots[nfds_to_poll] = maxProxyConnections;
-    activePollfds[nfds_to_poll++] = pollfds[maxProxyConnections];
+    if (stop == PROXY_RUNNING) {
+      activePollSlots[nfds_to_poll] = maxProxyConnections;
+      activePollfds[nfds_to_poll++] = pollfds[maxProxyConnections];
+    }
     for (int s = 0; s < maxnpeers; s++) {
       if (pollfds[s].fd == NCCL_INVALID_SOCKET) continue;
       pollfds[s].revents = 0;
@@ -1881,7 +1889,7 @@ void* ncclProxyService(void* _args) {
       WARN("[Proxy Service] Poll failed: %s", strerror(errno));
       goto fail;
     }
-    if (pollfds[maxProxyConnections].revents) {
+    if (stop == PROXY_RUNNING && pollfds[maxProxyConnections].revents) {
       // We got an event on the listenSock
       int s = 0;
       while (s < maxProxyConnections && pollfds[s].fd != NCCL_INVALID_SOCKET) s++;
@@ -1920,7 +1928,7 @@ void* ncclProxyService(void* _args) {
         closeConn = 1;
       }
       ncclProxyAsyncOp* op = peer->asyncOps;
-      while (op != nullptr) {
+      while (op != nullptr && !closeConn) {
         ncclProxyAsyncOp* opnext = op->next; /* in case op is freed in proxyProgressAsync */
         type = op->type;
         // Coverity gets confused here by complex code structure.  Yes, connectionPool.pools gets dereferenced, and
@@ -1996,6 +2004,9 @@ void* ncclProxyService(void* _args) {
       }
     }
   }
+
+  INFO(NCCL_PROXY, "[Proxy Service] exit: stop %d abortFlag %d npeers %d asyncOpCount %d", stop,
+       *proxyState->abortFlag, npeers, asyncOpCount);
 
   // Wait for all operations to complete and stop progress thread before freeing any resource
   if (ncclProxyProgressDestroy(proxyState) != ncclSuccess) {
@@ -2129,7 +2140,7 @@ ncclResult_t ncclProxyInit(struct ncclComm* comm, struct ncclSocket* sock, union
 
 ncclResult_t ncclProxyCreate(struct ncclComm* comm) {
   /* proxyState is shared among parent comm and split comms. comm->proxyState->thread is
-   * join()'d by commFree() in init.cc when the refCount reduces down to 0. */
+   * join()'d after ncclProxyStop() when the refCount reduces down to 0. */
   struct ncclProxyState* proxyState = comm->proxyState;
   if (proxyState->refCount == 1) {
     /* we have to make sure all following fields in comm have been initialized. */
@@ -2165,47 +2176,28 @@ ncclResult_t ncclProxyCreate(struct ncclComm* comm) {
   return ncclSuccess;
 }
 
-ncclResult_t ncclProxyRestart(struct ncclComm* comm, struct ncclSocket* sock, union ncclSocketAddress* peerAddresses,
-                              uint64_t* peerAddressesUDS) {
-  ncclResult_t ret = ncclSuccess;
-
-  if (comm == NULL || comm->sharedRes == NULL || sock == NULL || peerAddresses == NULL || peerAddressesUDS == NULL) {
-    WARN("ncclProxyRestart: invalid restart arguments");
-    return ncclInvalidArgument;
+static ncclResult_t ncclProxyClosePeerSockets(struct ncclProxyState* sharedProxyState) {
+  if (sharedProxyState->peerSocks) {
+    int peerArraySize = sharedProxyState->peerArraySize;
+    for (int i = 0; i < peerArraySize; i++) {
+      ncclSocketDescriptor fd;
+      NCCLCHECK(ncclSocketGetFd(sharedProxyState->peerSocks + i, &fd));
+      if (fd != NCCL_INVALID_SOCKET) {
+        if (sharedProxyState->proxyOps[i].pool) {
+          NCCLCHECK(ncclShmClose(sharedProxyState->proxyOps[i].handle));
+        }
+        if (sharedProxyState->sharedDevMems[i]) {
+          if (!ncclCuMemEnable()) {
+            CUDACHECK(cudaIpcCloseMemHandle(sharedProxyState->sharedDevMems[i]));
+          }
+        }
+        int type = ncclProxyMsgClose;
+        (void)ncclSocketSend(sharedProxyState->peerSocks + i, &type, sizeof(int));
+        NCCLCHECK(ncclSocketClose(sharedProxyState->peerSocks + i));
+      }
+    }
   }
-  if (comm->sharedRes->owner != comm || comm->proxyState != comm->sharedRes->proxyState) {
-    WARN("ncclProxyRestart: cannot restart proxy for shared-resource communicator");
-    return ncclInvalidUsage;
-  }
-  if (comm->proxyState == NULL) {
-    NCCLCHECK(ncclProxyInit(comm, sock, peerAddresses, peerAddressesUDS));
-    NCCLCHECK(ncclProxyCreate(comm));
-    return ncclSuccess;
-  }
-  if (comm->proxyState->refCount != 1) {
-    WARN("ncclProxyRestart: proxy refcount %d is not restartable", comm->proxyState->refCount);
-    return ncclInvalidUsage;
-  }
-
-  NCCLCHECKGOTO(ncclProxyStop(comm), ret, fail);
-  if (comm->proxyState && comm->proxyRefCountOld == 0 && comm->proxyState->thread.joinable()) {
-    comm->proxyState->thread.join();
-    if (comm->proxyState->threadUDS.joinable()) comm->proxyState->threadUDS.join();
-  }
-  comm->proxyState->peerAddresses = NULL;
-  comm->proxyState->peerAddressesUDS = NULL;
-  NCCLCHECKGOTO(ncclProxyDestroy(comm), ret, fail);
-  comm->sharedRes->proxyState = NULL;
-  comm->proxyState = NULL;
-  comm->proxyRefCountOld = 0;
-
-  NCCLCHECKGOTO(ncclProxyInit(comm, sock, peerAddresses, peerAddressesUDS), ret, fail);
-  NCCLCHECKGOTO(ncclProxyCreate(comm), ret, fail);
-
-exit:
-  return ret;
-fail:
-  goto exit;
+  return ncclSuccess;
 }
 
 ncclResult_t ncclProxyStop(struct ncclComm* comm) {
@@ -2214,7 +2206,7 @@ ncclResult_t ncclProxyStop(struct ncclComm* comm) {
 
     if ((comm->proxyRefCountOld = ncclAtomicRefCountDecrement(&sharedProxyState->refCount)) == 0) {
       if (*comm->abortFlag == 0 && sharedProxyState->peerAddresses) {
-        // We need to send a ncclProxyMsgStop message to our own proxy
+        // We need to send a ncclProxyMsgStop message to our own proxy.
         struct ncclSocket sock;
         int type = ncclProxyMsgStop;
         NCCLCHECK(ncclSocketInit(&sock, sharedProxyState->peerAddresses + comm->topParentRanks[comm->rank],
@@ -2225,28 +2217,9 @@ ncclResult_t ncclProxyStop(struct ncclComm* comm) {
         (void)ncclSocketClose(&sock);
       }
 
-      if (sharedProxyState->peerSocks) {
-        int peerArraySize = sharedProxyState->peerArraySize;
-        for (int i = 0; i < peerArraySize; i++) {
-          ncclSocketDescriptor fd;
-          NCCLCHECK(ncclSocketGetFd(sharedProxyState->peerSocks + i, &fd));
-          if (fd != NCCL_INVALID_SOCKET) {
-            if (sharedProxyState->proxyOps[i].pool) {
-              NCCLCHECK(ncclShmClose(sharedProxyState->proxyOps[i].handle));
-            }
-            if (sharedProxyState->sharedDevMems[i]) {
-              if (!ncclCuMemEnable()) {
-                CUDACHECK(cudaIpcCloseMemHandle(sharedProxyState->sharedDevMems[i]));
-              }
-            }
-            int type = ncclProxyMsgClose;
-            (void)ncclSocketSend(sharedProxyState->peerSocks + i, &type, sizeof(int));
-            NCCLCHECK(ncclSocketClose(sharedProxyState->peerSocks + i));
-          }
-        }
-      }
+      NCCLCHECK(ncclProxyClosePeerSockets(sharedProxyState));
       // Now we notify proxy service and UDS thread to exit.
-      COMPILER_ATOMIC_STORE(&comm->proxyState->stop, 1, std::memory_order_release);
+      COMPILER_ATOMIC_STORE(&sharedProxyState->stop, PROXY_STOP, std::memory_order_release);
     }
   }
 
@@ -2261,8 +2234,6 @@ ncclResult_t ncclProxyDestroy(struct ncclComm* comm) {
       WARN("Proxy state refCount is %d, expected 0", sharedProxyState->refCount);
       return ncclInternalError;
     }
-    free(sharedProxyState->peerAddresses);
-    free(sharedProxyState->peerAddressesUDS);
     free(sharedProxyState->peerSocks);
     free(sharedProxyState->proxyOps);
     free(sharedProxyState->sharedDevMems);
