@@ -589,6 +589,7 @@ ncclResult_t ncclGinDevCommDisconnectAll(struct ncclComm* comm) {
     }
     dc->connected = false;
     dc->connectionCount = 0;
+    NCCLCHECKGOTO(ncclGinDevCommStoreDynamic(dc, NULL), ret, exit);
   }
 
   for (int backendIdx = 0; backendIdx < ginState->numActiveBackends; backendIdx++) {

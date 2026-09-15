@@ -796,9 +796,13 @@ static ncclResult_t symMemoryRegisterRma(struct ncclComm* comm, struct ncclDevrM
   return ncclSuccess;
 }
 
-static void symMemoryDeregisterRma(struct ncclComm* comm, struct ncclDevrMemory* mem) {
-  if (!ncclDevrWinRegEnabled(mem->winFlags, ncclDevrRegisterRma)) return;
-  if (mem->maxGlobalNumSegments == 1) ncclRmaProxyDeregister(comm, mem->rmaHostWins);
+static ncclResult_t symMemoryDeregisterRma(struct ncclComm* comm, struct ncclDevrMemory* mem) {
+  if (!ncclDevrWinRegEnabled(mem->winFlags, ncclDevrRegisterRma)) return ncclSuccess;
+  if (mem->maxGlobalNumSegments == 1) {
+    NCCLCHECK(ncclRmaProxyDeregister(comm, mem->rmaHostWins));
+    memset(mem->rmaHostWins, 0, sizeof(mem->rmaHostWins));
+  }
+  return ncclSuccess;
 }
 
 // On success we take caller's reference on memHandle.
@@ -1043,7 +1047,7 @@ static void symMemoryDropRef(struct ncclComm* comm, struct ncclDevrMemory* mem) 
   if (mem != nullptr && 0 == --mem->refCount) {
     struct ncclDevrState* devr = &comm->devrState;
     if (devr->ginEnabled && mem->ginSegmentInfos != nullptr) (void)symMemoryDeregisterGin(comm, mem);
-    if (devr->rmaProxyEnabled) symMemoryDeregisterRma(comm, mem);
+    if (devr->rmaProxyEnabled) (void)symMemoryDeregisterRma(comm, mem);
     bool counted = mem->winFlags & NCCL_WIN_CFT_COUNTED;
     ncclCftLeId leUcSelf =
       devr->le[counted].baseId == NCCL_LE_ID_INVALID ? NCCL_LE_ID_INVALID : devr->le[counted].baseId + devr->cftSelf;
@@ -1422,15 +1426,22 @@ static ncclResult_t ncclDevrQuiesceGinInternal(struct ncclComm* comm) {
   ncclResult_t ret = ncclSuccess;
   struct ncclDevrState* devr = &comm->devrState;
 
-  if (!devr->ginEnabled) return ncclSuccess;
+  if (!devr->ginEnabled && !devr->rmaProxyEnabled) return ncclSuccess;
 
-  if (comm->sharedRes->ginState.connected) {
+  if (devr->rmaProxyEnabled && comm->rmaState.rmaProxyState.connected) {
+    for (struct ncclDevrMemory* mem = devr->memHead; mem != nullptr; mem = mem->next) {
+      NCCLCHECKGOTO(symMemoryDeregisterRma(comm, mem), ret, exit);
+    }
+    NCCLCHECKGOTO(ncclRmaProxyDisconnect(comm), ret, exit);
+  }
+
+  if (devr->ginEnabled && comm->sharedRes->ginState.connected) {
     for (struct ncclDevrMemory* mem = devr->memHead; mem != nullptr; mem = mem->next) {
       NCCLCHECKGOTO(symMemoryDeregisterGin(comm, mem), ret, exit);
     }
   }
 
-  NCCLCHECKGOTO(ncclGinDevCommDisconnectAll(comm), ret, exit);
+  if (devr->ginEnabled) NCCLCHECKGOTO(ncclGinDevCommDisconnectAll(comm), ret, exit);
 
 exit:
   return ret;
@@ -1442,7 +1453,7 @@ ncclResult_t ncclDevrQuiesceGin(struct ncclComm* comm) {
   bool savedDev = false;
   cudaStreamCaptureMode captureMode = cudaStreamCaptureModeRelaxed;
 
-  if (!comm->devrState.ginEnabled) return ncclSuccess;
+  if (!comm->devrState.ginEnabled && !comm->devrState.rmaProxyEnabled) return ncclSuccess;
 
   CUDACHECKGOTO(cudaThreadExchangeStreamCaptureMode(&captureMode), ret, exit);
   CUDACHECKGOTO(cudaGetDevice(&saveDev), ret, exit);
@@ -1464,7 +1475,7 @@ ncclResult_t ncclDevrJoinFinalizeGin(struct ncclComm* comm) {
   cudaStream_t stream = nullptr;
   cudaStreamCaptureMode captureMode = cudaStreamCaptureModeRelaxed;
 
-  if (!devr->ginEnabled) return ncclSuccess;
+  if (!devr->ginEnabled && !devr->rmaProxyEnabled) return ncclSuccess;
 
   CUDACHECKGOTO(cudaThreadExchangeStreamCaptureMode(&captureMode), ret, exit);
   CUDACHECKGOTO(cudaGetDevice(&saveDev), ret, exit);
@@ -1472,15 +1483,27 @@ ncclResult_t ncclDevrJoinFinalizeGin(struct ncclComm* comm) {
   CUDACHECKGOTO(cudaSetDevice(comm->cudaDev), ret, exit);
 
   NCCLCHECKGOTO(ncclDevrQuiesceGinInternal(comm), ret, exit);
-  NCCLCHECKGOTO(ncclGinConnectOnce(comm), ret, exit);
-  for (struct ncclDevrMemory* mem = devr->memHead; mem != nullptr; mem = mem->next) {
-    NCCLCHECKGOTO(symMemoryRegisterGin(comm, mem), ret, exit);
+  // A self-only active mask has no peer GIN connection to rebuild. Keep the
+  // quiesce above so stale GIN resources are still torn down after reshape.
+  if (ncclCommCountActiveRanks(comm) <= 1) goto exit;
+  if (devr->rmaProxyEnabled) {
+    for (struct ncclDevrMemory* mem = devr->memHead; mem != nullptr; mem = mem->next) {
+      NCCLCHECKGOTO(symMemoryRegisterRma(comm, mem), ret, exit);
+    }
   }
-  NCCLCHECKGOTO(ncclGinDevCommConnectAll(comm), ret, exit);
+  if (devr->ginEnabled) {
+    NCCLCHECKGOTO(ncclGinConnectOnce(comm), ret, exit);
+    for (struct ncclDevrMemory* mem = devr->memHead; mem != nullptr; mem = mem->next) {
+      NCCLCHECKGOTO(symMemoryRegisterGin(comm, mem), ret, exit);
+    }
+    NCCLCHECKGOTO(ncclGinDevCommConnectAll(comm), ret, exit);
+  }
 
-  CUDACHECKGOTO(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), ret, exit);
-  NCCLCHECKGOTO(ncclDevrRefreshGinWindows(comm, stream), ret, exit);
-  CUDACHECKGOTO(cudaStreamSynchronize(stream), ret, exit);
+  if (devr->ginEnabled) {
+    CUDACHECKGOTO(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), ret, exit);
+    NCCLCHECKGOTO(ncclDevrRefreshGinWindows(comm, stream), ret, exit);
+    CUDACHECKGOTO(cudaStreamSynchronize(stream), ret, exit);
+  }
 
 exit:
   if (stream != nullptr) {

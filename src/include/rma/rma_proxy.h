@@ -205,6 +205,7 @@ ncclResult_t ncclRmaProxyReclaimPlan(struct ncclComm* comm, struct ncclKernelPla
 
 // RMA Proxy lifecycle functions
 ncclResult_t ncclRmaProxyConnectOnce(struct ncclComm* comm);
+ncclResult_t ncclRmaProxyDisconnect(struct ncclComm* comm);
 ncclResult_t ncclRmaProxyFinalize(struct ncclComm* comm);
 
 // True when NCCL should provision internal RMA contexts for the hierarchical CE

@@ -343,8 +343,11 @@ ncclResult_t ncclRmaProxyRegister(struct ncclComm* comm, void* address, size_t s
 
 ncclResult_t ncclRmaProxyDeregister(struct ncclComm* comm, void* rmaHostWins[NCCL_RMA_MAX_CONNECTIONS]) {
   struct ncclRmaProxyState* rmaProxyState = &comm->rmaState.rmaProxyState;
+  if (!rmaProxyState->connected) return ncclSuccess;
   for (int n = 0; n < rmaProxyState->rmaCommCount; n++) {
+    if (rmaHostWins[n] == NULL) continue;
     NCCLCHECK(rmaProxyState->ncclRma->deregMrSym(rmaProxyState->rmaComms[n], rmaHostWins[n]));
+    rmaHostWins[n] = NULL;
   }
   return ncclSuccess;
 }
@@ -500,7 +503,7 @@ fail:
   goto exit;
 }
 
-ncclResult_t ncclRmaProxyFinalize(struct ncclComm* comm) {
+ncclResult_t ncclRmaProxyDisconnect(struct ncclComm* comm) {
   struct ncclRmaProxyState* rmaProxyState = &comm->rmaState.rmaProxyState;
   if (!rmaProxyState->connected) return ncclSuccess;
 
@@ -509,7 +512,7 @@ ncclResult_t ncclRmaProxyFinalize(struct ncclComm* comm) {
     rmaProxyState->rmaProgress = -1;
     rmaProxyState->cond.notify_one();
   }
-  rmaProxyState->thread.join();
+  if (rmaProxyState->thread.joinable()) rmaProxyState->thread.join();
 
   // Destroy all virtual RMA proxy contexts
   if (rmaProxyState->rmaProxyCtxs) {
@@ -532,7 +535,26 @@ ncclResult_t ncclRmaProxyFinalize(struct ncclComm* comm) {
     }
   }
 
-  memset((void*)rmaProxyState, 0, sizeof(*rmaProxyState));
+  rmaProxyState->connected = false;
+  rmaProxyState->rmaCommCount = 0;
+  rmaProxyState->rmaProxyCtxCount = 0;
+  rmaProxyState->numIntCtx = 0;
+  rmaProxyState->rmaProgress = 0;
+  rmaProxyState->asyncResult = ncclSuccess;
+  memset(rmaProxyState->rmaComms, 0, sizeof(rmaProxyState->rmaComms));
+  memset(rmaProxyState->props, 0, sizeof(rmaProxyState->props));
+  return ncclSuccess;
+}
+
+ncclResult_t ncclRmaProxyFinalize(struct ncclComm* comm) {
+  struct ncclRmaProxyState* rmaProxyState = &comm->rmaState.rmaProxyState;
+  NCCLCHECK(ncclRmaProxyDisconnect(comm));
+
+  rmaProxyState->comm = NULL;
+  rmaProxyState->ncclRma = NULL;
+  rmaProxyState->rmaVersion = 0;
+  rmaProxyState->rmaInstance = NULL;
+  rmaProxyState->rmaType = 0;
   return ncclSuccess;
 }
 

@@ -470,6 +470,7 @@ ncclResult_t ncclRmaIbProxyDestroyContext(void* rmaCtx) {
       gc[c].fullSendComm = NULL;
     }
   }
+  free(gc);
   return ncclSuccess;
 }
 
