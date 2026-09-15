@@ -170,7 +170,8 @@ ncclResult_t initGdrCopy() {
 }
 
 static ncclResult_t initResult = ncclSuccess;
-static std::once_flag initOnceFlag;
+static std::mutex initMutex;
+static int initDone = 0;
 
 static void initOnceFunc() {
   NCCLCHECKGOTO(ncclOsInitialize(), initResult, exit);
@@ -183,8 +184,14 @@ exit:;
 }
 
 static ncclResult_t ncclInit() {
-  std::call_once(initOnceFlag, initOnceFunc);
-  return initResult;
+  std::lock_guard<std::mutex> lock(initMutex);
+  if (initDone == 0) {
+    initOnceFunc();
+    initDone = 1;
+  }
+  if (initResult != ncclSuccess) return initResult;
+  NCCLCHECK(bootstrapNetInit());
+  return ncclSuccess;
 }
 
 static ncclResult_t envInitResult = ncclSuccess;
@@ -520,6 +527,29 @@ exit:
   return ret;
 }
 
+static ncclResult_t commResolveDeviceIdentity(struct ncclComm* comm) {
+  nvmlDevice_t nvmlDev;
+  char busId[NVML_DEVICE_PCI_BUS_ID_BUFFER_SIZE];
+  int currentCudaDev = -1;
+  int cudaDevCount = -1;
+  cudaError_t currentCudaDevErr = cudaGetDevice(&currentCudaDev);
+  cudaError_t cudaDevCountErr = cudaGetDeviceCount(&cudaDevCount);
+  unsigned int nvmlDevIndex;
+
+  NCCLCHECK(getBusId(comm->cudaDev, &comm->busId));
+  NCCLCHECK(int64ToBusId(comm->busId, busId));
+  INFO(NCCL_INIT, "commResolveDeviceIdentity comm %p rank %d nranks %d cudaDev %d currentCudaDev %d(%s) "
+                  "cudaDevCount %d(%s) busId %s busIdHex %lx",
+       comm, comm->rank, comm->nRanks, comm->cudaDev, currentCudaDev, cudaGetErrorString(currentCudaDevErr),
+       cudaDevCount, cudaGetErrorString(cudaDevCountErr), busId, comm->busId);
+  NCCLCHECK(ncclNvmlDeviceGetHandleByPciBusId(busId, &nvmlDev));
+  NCCLCHECK(ncclNvmlDeviceGetIndex(nvmlDev, &nvmlDevIndex));
+  INFO(NCCL_INIT, "commResolveDeviceIdentity comm %p rank %d cudaDev %d busId %s nvmlDevIndex %u",
+       comm, comm->rank, comm->cudaDev, busId, nvmlDevIndex);
+  comm->nvmlDev = (int)nvmlDevIndex;
+  return ncclSuccess;
+}
+
 static ncclResult_t commAlloc(struct ncclComm* comm, struct ncclComm* parent, int ndev, int rank) {
   if (ndev < 1) {
     WARN("invalid device count (%d) requested", ndev);
@@ -591,12 +621,7 @@ static ncclResult_t commAlloc(struct ncclComm* comm, struct ncclComm* parent, in
 
   NCCLCHECK(ncclCudaContextTrack(&comm->context, comm->config.launchOrderImplicit, comm->commHash));
 
-  NCCLCHECK(getBusId(comm->cudaDev, &comm->busId));
-  nvmlDevice_t nvmlDev;
-  char busId[NVML_DEVICE_PCI_BUS_ID_BUFFER_SIZE];
-  NCCLCHECK(int64ToBusId(comm->busId, busId));
-  NCCLCHECK(ncclNvmlDeviceGetHandleByPciBusId(busId, &nvmlDev));
-  NCCLCHECK(ncclNvmlDeviceGetIndex(nvmlDev, (unsigned int*)&comm->nvmlDev));
+  NCCLCHECK(commResolveDeviceIdentity(comm));
 
   TRACE(NCCL_INIT, "comm %p rank %d nranks %d cudaDev %d busId %lx compCap %d", comm, rank, ndev, comm->cudaDev,
         comm->busId, comm->compCap);
@@ -3888,8 +3913,12 @@ NCCL_API(ncclResult_t, ncclNetQuiesce);
 ncclResult_t ncclNetQuiesce() {
   NCCL_NVTX3_FUNC_RANGE;
   ncclResult_t res = ncclNetQuiesceInternal();
+  if (res != ncclSuccess) return res;
   ncclResult_t rasRes = ncclRasQuiesce();
-  return res == ncclSuccess ? rasRes : res;
+  if (rasRes != ncclSuccess) return rasRes;
+  NCCLCHECK(ncclNvmlReset());
+  NCCLCHECK(bootstrapNetReset());
+  return ncclSuccess;
 }
 
 NCCL_API(ncclResult_t, ncclCommQuiesce, ncclComm_t comm);

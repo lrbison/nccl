@@ -240,11 +240,17 @@ ncclResult_t bootstrapNetInit() {
   return ncclSuccess;
 }
 
-ncclResult_t bootstrapNetRediscover() {
+ncclResult_t bootstrapNetReset() {
+  std::lock_guard<std::mutex> lock(bootstrapNetMutex);
   bootstrapNetInitDone = 0;
   bootstrapNetDevOOB = -1;
   memset(bootstrapNetIfName, 0, sizeof(bootstrapNetIfName));
   memset(&bootstrapNetIfAddr, 0, sizeof(bootstrapNetIfAddr));
+  return ncclSuccess;
+}
+
+ncclResult_t bootstrapNetRediscover() {
+  NCCLCHECK(bootstrapNetReset());
   NCCLCHECK(bootstrapNetInit());
   return ncclSuccess;
 }
@@ -578,6 +584,7 @@ ncclResult_t bootstrapReshapeCreateRoot(struct ncclBootstrapHandle* handle, nccl
   handle->nRanks = comm->nRanks;
   handle->flags = NCCL_UNIQUE_ID_RESHAPE;
   handle->leaderRank = comm->rank;
+  NCCLCHECKGOTO(bootstrapNetInit(), ret, fail);
   memcpy(&handle->addr, &bootstrapNetIfAddr, sizeof(union ncclSocketAddress));
   if (state->listenSock != NULL) {
     memcpy(&handle->addr, &state->listenSock->addr, sizeof(handle->addr));
@@ -993,6 +1000,7 @@ ncclResult_t bootstrapGetUniqueId(struct ncclBootstrapHandle* handle, struct ncc
     handle->nRanks = comm ? comm->nRanks : 0;
     handle->flags = NCCL_UNIQUE_ID_DEFAULT;
     handle->leaderRank = comm ? comm->rank : -1;
+    NCCLCHECK(bootstrapNetInit());
     memcpy(&handle->addr, &bootstrapNetIfAddr, sizeof(union ncclSocketAddress));
     NCCLCHECK(bootstrapCreateRoot(handle, false));
   }
@@ -1076,6 +1084,7 @@ struct bootstrapState {
 // helper functions
 static ncclResult_t createListenSocket(struct ncclComm* comm, uint64_t magic, struct ncclSocket* socket,
                                        union ncclSocketAddress* addr, ncclSocketType type) {
+  NCCLCHECK(bootstrapNetInit());
   NCCLCHECK(ncclSocketInit(socket, &bootstrapNetIfAddr, magic, type, comm->abortFlag));
   NCCLCHECK(ncclSocketListen(socket));
   NCCLCHECK(ncclSocketGetAddr(socket, addr));
@@ -1401,6 +1410,17 @@ ncclResult_t bootstrapQuiesceLocalAddresses(struct ncclComm* comm) {
     NCCLCHECK(ncclSocketClose(&STATE_LISTEN(state, socket)));
   }
   NCCLCHECK(ncclSocketClose(&STATE_LISTEN(state, peerSocket)));
+  if (state->ringAddresses != NULL) memset(state->ringAddresses + comm->rank, 0, sizeof(*state->ringAddresses));
+  if (state->peerP2pAddresses != NULL) {
+    memset(state->peerP2pAddresses + comm->rank, 0, sizeof(*state->peerP2pAddresses));
+  }
+  if (state->peerProxyAddresses != NULL) {
+    memset(state->peerProxyAddresses + comm->rank, 0, sizeof(*state->peerProxyAddresses));
+  }
+  if (state->peerProxyAddressesUDS != NULL) {
+    memset(state->peerProxyAddressesUDS + comm->rank, 0, sizeof(*state->peerProxyAddressesUDS));
+  }
+  if (state->rasRanks != NULL) memset(state->rasRanks + comm->rank, 0, sizeof(*state->rasRanks));
 
   INFO(NCCL_INIT, "comm %p rank %d nRanks %d - BootstrapQuiesce COMPLETE", comm, comm->rank, comm->nRanks);
   return ncclSuccess;

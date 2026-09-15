@@ -10,9 +10,11 @@
 #include "debug.h"
 #include "os.h"
 
+#include <atomic>
 #include <initializer_list>
 #include <memory>
 #include <mutex>
+#include <string.h>
 
 int ncclNvmlDeviceCount = 0;
 ncclNvmlDeviceInfo ncclNvmlDevices[ncclNvmlMaxDevices];
@@ -65,8 +67,9 @@ NCCL_NVML_FN(nvmlSystemGetConfComputeSettings, nvmlReturn_t, (nvmlSystemConfComp
 
 std::mutex lock; // NVML has had some thread safety bugs
 bool initialized = false;
-thread_local bool threadInitialized = false;
-ncclResult_t initResult;
+std::atomic<int> initGeneration(1);
+thread_local int threadInitGeneration = 0;
+ncclResult_t initResult = ncclSuccess;
 
 union nvmlCCInfoInternal {
   nvmlConfComputeSystemState_t settingV12020;
@@ -77,8 +80,9 @@ union nvmlCCInfoInternal {
 ncclResult_t ncclNvmlEnsureInitialized() {
   // Optimization to avoid repeatedly grabbing the lock when we only want to
   // read from the global tables.
-  if (threadInitialized) return initResult;
-  threadInitialized = true;
+  int generation = initGeneration.load(std::memory_order_acquire);
+  if (threadInitGeneration == generation) return initResult;
+  threadInitGeneration = generation;
 
   std::lock_guard<std::mutex> locked(lock);
 
@@ -211,6 +215,38 @@ ncclResult_t ncclNvmlEnsureInitialized() {
   return initResult;
 }
 
+ncclResult_t ncclNvmlReset() {
+  std::lock_guard<std::mutex> locked(lock);
+
+  if (initialized) {
+#if NCCL_NVML_DIRECT
+    bool haveShutdown = true;
+#else
+    bool haveShutdown = pfn_nvmlShutdown != nullptr;
+#endif
+    if (haveShutdown) {
+      nvmlReturn_t res = pfn_nvmlShutdown();
+      if (res != NVML_SUCCESS) {
+#if NCCL_NVML_DIRECT
+        const char* errorString = pfn_nvmlErrorString(res);
+#else
+        const char* errorString = pfn_nvmlErrorString ? pfn_nvmlErrorString(res) : "unknown";
+#endif
+        INFO(NCCL_INIT, "nvmlShutdown() failed during reset: %s", errorString);
+      }
+    }
+  }
+
+  initialized = false;
+  initResult = ncclSuccess;
+  ncclNvmlDeviceCount = 0;
+  memset(ncclNvmlDevices, 0, sizeof(ncclNvmlDevices));
+  memset(ncclNvmlDevicePairs, 0, sizeof(ncclNvmlDevicePairs));
+  initGeneration.fetch_add(1, std::memory_order_acq_rel);
+  threadInitGeneration = 0;
+  return ncclSuccess;
+}
+
 #define NVMLCHECK(name, ...) \
   do { \
     nvmlReturn_t e44241808 = pfn_##name(__VA_ARGS__); \
@@ -241,6 +277,7 @@ ncclResult_t ncclNvmlDeviceGetHandleByPciBusId(const char* pciBusId, nvmlDevice_
 
 ncclResult_t ncclNvmlDeviceGetHandleByIndex(unsigned int index, nvmlDevice_t* device) {
   NCCLCHECK(ncclNvmlEnsureInitialized());
+  if ((int)index >= ncclNvmlDeviceCount) return ncclInvalidArgument;
   *device = ncclNvmlDevices[index].handle;
   return ncclSuccess;
 }

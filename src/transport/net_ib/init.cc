@@ -419,6 +419,8 @@ static ncclResult_t ncclIbCloseDeviceContexts(void) {
   return ncclSuccess;
 }
 
+static void ncclIbAutoPolicyReset(void);
+
 static void ncclIbResetDeviceState(int d) {
   free(ncclIbDevs[d].pciPath);
   ncclIbDevs[d].pciPath = NULL;
@@ -464,6 +466,7 @@ static void ncclIbResetDevices(void) {
   ncclIbIfName[0] = '\0';
   memset(&ncclIbIfAddr, 0, sizeof(ncclIbIfAddr));
   ncclGinIbGdakiResetDevices();
+  ncclIbAutoPolicyReset();
 }
 
 static ncclResult_t ncclIbCloseDeviceState(void) {
@@ -518,6 +521,17 @@ static bool ncclIbIsCx9(const struct ncclIbDev* dev) {
 }
 static const int NCCL_IB_VR_SOCKET_COUNT = 2;
 static const int NCCL_IB_VR_RAILS_PER_SOCKET = 2;
+static std::mutex ncclIbAutoPolicyMutex;
+static int ncclIbAutoPolicyDone = 0;
+static int ncclIbAutoPolicyCount = 0;
+static ncclIbRailPolicy ncclIbAutoPolicyCache = NCCL_IB_RAIL_POLICY_NONE;
+
+static void ncclIbAutoPolicyReset(void) {
+  std::lock_guard<std::mutex> lock(ncclIbAutoPolicyMutex);
+  ncclIbAutoPolicyDone = 0;
+  ncclIbAutoPolicyCount = 0;
+  ncclIbAutoPolicyCache = NCCL_IB_RAIL_POLICY_NONE;
+}
 
 static ncclResult_t ncclIbGetRailPolicy(enum ncclIbRailPolicy* policy) {
   static std::once_flag onceFlag;
@@ -555,27 +569,29 @@ static int ncclIbGetPciIndex(int nPaths, const char** pciPaths, struct ncclIbDev
 
 // returns the policy and the total number of devices subject to the policy.
 static ncclResult_t ncclIbAutoPolicy(enum ncclIbRailPolicy* policy, int* nDevs) {
-  static int count = 0;
-  static ncclIbRailPolicy cache = NCCL_IB_RAIL_POLICY_NONE;
-  NCCLCHECK(ncclIbGetRailPolicy(&cache));
+  enum ncclIbRailPolicy railPolicy;
+  NCCLCHECK(ncclIbGetRailPolicy(&railPolicy));
 
-  static std::once_flag onceFlag;
-  std::call_once(onceFlag, [&]() {
-    if (ncclIbCpuArchAarch64 && (cache == NCCL_IB_RAIL_POLICY_CX9_BLOCK || cache == NCCL_IB_RAIL_POLICY_CX9_ALT ||
-                                 cache == NCCL_IB_RAIL_POLICY_CX9_FLIP)) {
-      count = 0;
+  std::lock_guard<std::mutex> lock(ncclIbAutoPolicyMutex);
+  if (ncclIbAutoPolicyDone == 0) {
+    ncclIbAutoPolicyCache = railPolicy;
+    ncclIbAutoPolicyCount = 0;
+    if (ncclIbCpuArchAarch64 && (ncclIbAutoPolicyCache == NCCL_IB_RAIL_POLICY_CX9_BLOCK ||
+                                 ncclIbAutoPolicyCache == NCCL_IB_RAIL_POLICY_CX9_ALT ||
+                                 ncclIbAutoPolicyCache == NCCL_IB_RAIL_POLICY_CX9_FLIP)) {
       const char* devPciPath[MAX_IB_DEVS] = {};
       for (int d = 0; d < ncclNIbDevs; d++) {
         struct ncclIbDev* dev = ncclIbDevs + d;
         if (!ncclIbIsCx9(dev)) continue;
-        int devId = ncclIbGetPciIndex(count, devPciPath, dev);
-        if (devId == count) devPciPath[count++] = dev->pciPath;
+        int devId = ncclIbGetPciIndex(ncclIbAutoPolicyCount, devPciPath, dev);
+        if (devId == ncclIbAutoPolicyCount) devPciPath[ncclIbAutoPolicyCount++] = dev->pciPath;
       }
-      if (count == 0) cache = NCCL_IB_RAIL_POLICY_NONE;
+      if (ncclIbAutoPolicyCount == 0) ncclIbAutoPolicyCache = NCCL_IB_RAIL_POLICY_NONE;
     }
-  });
-  *policy = cache;
-  *nDevs = count;
+    ncclIbAutoPolicyDone = 1;
+  }
+  *policy = ncclIbAutoPolicyCache;
+  *nDevs = ncclIbAutoPolicyCount;
   return ncclSuccess;
 }
 

@@ -24,6 +24,7 @@ static_assert(sizeof(struct ncclBootstrapHandle) <= sizeof(ncclUniqueId),
               "Bootstrap handle is too large to fit inside NCCL unique ID");
 
 ncclResult_t bootstrapNetInit();
+ncclResult_t bootstrapNetReset();
 ncclResult_t bootstrapNetRediscover();
 ncclResult_t bootstrapCreateRoot(struct ncclBootstrapHandle* handle, bool idFromEnv);
 ncclResult_t bootstrapCreateListenSocket(struct ncclBootstrapHandle* handle, struct ncclComm* comm,

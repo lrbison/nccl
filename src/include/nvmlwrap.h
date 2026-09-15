@@ -367,6 +367,7 @@ struct ncclNvmlCCStatus {
 // Outsiders need only call it if they want to inspect the ncclNvml global
 // tables above.
 ncclResult_t ncclNvmlEnsureInitialized();
+ncclResult_t ncclNvmlReset();
 
 ncclResult_t ncclNvmlDeviceGetHandleByPciBusId(const char* pciBusId, nvmlDevice_t* device);
 ncclResult_t ncclNvmlDeviceGetIndex(nvmlDevice_t device, unsigned* index);
