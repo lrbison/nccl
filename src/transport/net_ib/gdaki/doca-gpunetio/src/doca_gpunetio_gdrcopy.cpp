@@ -39,6 +39,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <mutex>
 #include "doca_gpunetio_gdrcopy.h"
 #include "doca_gpunetio_log.hpp"
 
@@ -117,6 +118,10 @@ struct doca_gpu_gdrcopy_function_table {
 
 static struct doca_gpu_gdrcopy_function_table *doca_gpu_gdrcopy_ftable = NULL;
 static gdr_t doca_gpu_gdr = NULL;
+static std::mutex doca_gpu_gdrcopy_mutex;
+static bool doca_gpu_gdrcopy_tried_init = false;
+static bool doca_gpu_gdrcopy_supported = false;
+static int doca_gpu_gdrcopy_ref_count = 0;
 
 static int doca_gpu_gdrcopy_ftable_init(struct doca_gpu_gdrcopy_function_table **ftable) {
     int status = 0;
@@ -202,16 +207,44 @@ static bool doca_gpu_enable_gdrcopy() {
     return true;
 }
 
-bool doca_gpu_gdrcopy_is_supported() {
-    static bool is_tried_init = false;
-    static bool is_supported = false;
-    if (!is_tried_init) {
+static bool doca_gpu_gdrcopy_is_supported_locked() {
+    if (!doca_gpu_gdrcopy_tried_init || (doca_gpu_gdrcopy_supported && !doca_gpu_gdr)) {
         bool enabled = doca_gpu_enable_gdrcopy();
-        is_supported = (enabled && (doca_gpu_init_gdrcopy() == 0));
-        DOCA_LOG(LOG_INFO, "GDRCopy usage is %s", is_supported ? "enabled" : "disabled");
-        is_tried_init = true;
+        doca_gpu_gdrcopy_supported = (enabled && (doca_gpu_init_gdrcopy() == 0));
+        DOCA_LOG(LOG_INFO, "GDRCopy usage is %s", doca_gpu_gdrcopy_supported ? "enabled" : "disabled");
+        doca_gpu_gdrcopy_tried_init = true;
     }
-    return is_supported;
+    return doca_gpu_gdrcopy_supported;
+}
+
+bool doca_gpu_gdrcopy_is_supported() {
+    std::lock_guard<std::mutex> lock(doca_gpu_gdrcopy_mutex);
+    return doca_gpu_gdrcopy_is_supported_locked();
+}
+
+bool doca_gpu_gdrcopy_acquire() {
+    std::lock_guard<std::mutex> lock(doca_gpu_gdrcopy_mutex);
+    if (!doca_gpu_gdrcopy_is_supported_locked()) return false;
+    doca_gpu_gdrcopy_ref_count++;
+    return true;
+}
+
+int doca_gpu_gdrcopy_release() {
+    std::lock_guard<std::mutex> lock(doca_gpu_gdrcopy_mutex);
+    if (doca_gpu_gdrcopy_ref_count <= 0) {
+        DOCA_LOG(LOG_WARNING, "GDRCopy release called without a matching acquire");
+        return EINVAL;
+    }
+    doca_gpu_gdrcopy_ref_count--;
+    if (doca_gpu_gdrcopy_ref_count == 0 && doca_gpu_gdr) {
+        int status = doca_gpu_gdrcopy_ftable->close(doca_gpu_gdr);
+        if (status) {
+            DOCA_LOG(LOG_ERR, "Error in gdr_close");
+            return status;
+        }
+        doca_gpu_gdr = NULL;
+    }
+    return 0;
 }
 
 bool doca_gpu_gdrcopy_supports_force_pcie() {

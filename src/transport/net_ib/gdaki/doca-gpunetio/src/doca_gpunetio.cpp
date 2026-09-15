@@ -197,8 +197,9 @@ doca_error_t doca_gpu_create(const char *gpu_bus_id, doca_gpu_t **gpu_dev) {
     gpu_dev_->open->support_uar_gpumem = true;
     gpu_dev_->open->support_bf_uar = true;
     gpu_dev_->open->support_async_store_release = priv_query_async_store_release_support();
-    gpu_dev_->open->support_gdrcopy = doca_gpu_gdrcopy_is_supported();
-    gpu_dev_->open->support_gdrcopy_data_direct = doca_gpu_gdrcopy_supports_force_pcie();
+    gpu_dev_->open->support_gdrcopy = doca_gpu_gdrcopy_acquire();
+    gpu_dev_->open->support_gdrcopy_data_direct =
+        gpu_dev_->open->support_gdrcopy ? doca_gpu_gdrcopy_supports_force_pcie() : false;
 
     try {
         gpu_dev_->open->mtable = new std::unordered_map<uintptr_t, struct doca_gpu_mtable *>();
@@ -213,6 +214,7 @@ doca_error_t doca_gpu_create(const char *gpu_bus_id, doca_gpu_t **gpu_dev) {
 
 exit_error:
     if (gpu_dev_ != nullptr) {
+        if (gpu_dev_->open && gpu_dev_->open->support_gdrcopy) doca_gpu_gdrcopy_release();
         if (gpu_dev_->open) free(gpu_dev_->open);
         free(gpu_dev_);
     }
@@ -254,6 +256,10 @@ doca_error_t doca_gpu_destroy(doca_gpu_t *gpu_dev) {
             goto exit;
         }
         delete gpu_dev->open->mtable;
+    }
+    if (gpu_dev->open->support_gdrcopy && doca_gpu_gdrcopy_release() != 0) {
+        status = DOCA_ERROR_DRIVER;
+        goto exit;
     }
 
 exit:

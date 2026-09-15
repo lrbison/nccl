@@ -44,6 +44,8 @@ extern "C" {
 #endif
 
 bool doca_gpu_gdrcopy_is_supported();
+bool doca_gpu_gdrcopy_acquire();
+int doca_gpu_gdrcopy_release();
 bool doca_gpu_gdrcopy_supports_force_pcie();
 int doca_gpu_gdrcopy_create_mapping(void *dev_aligned_ptr, size_t size, bool force_pcie,
                                     void **out_mh, void **out_host_ptr);
