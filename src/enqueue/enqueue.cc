@@ -2696,6 +2696,7 @@ static ncclResult_t p2pTaskAppend(struct ncclComm* comm, struct ncclInfo* info, 
 
   // Mark channels that need pre-connect
   if (comm->rank != peer) {
+    comm->p2pSendRecvSeen = true;
     if (!(isSendNotRecv ? planner->peers[peer].sendSeen : planner->peers[peer].recvSeen)) {
       // planner->peers[peer].send/recvSeen is private to each comm, so we need to set it anyway.
       (isSendNotRecv ? planner->peers[peer].sendSeen : planner->peers[peer].recvSeen) = true;

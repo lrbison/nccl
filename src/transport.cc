@@ -8,6 +8,7 @@
 #include "comm.h"
 #include "info.h"
 #include "bootstrap.h"
+#include "channel.h"
 #define ENABLE_TIMER 0
 #include "timer.h"
 #include "transport.h"
@@ -104,6 +105,10 @@ ncclResult_t ncclTransportClosePeer(struct ncclComm* comm, int peer) {
     }
   }
 
+  if (comm->planner.peers != NULL) {
+    comm->planner.peers[peer].sendSeen = false;
+    comm->planner.peers[peer].recvSeen = false;
+  }
   comm->connectSend[peer] = 0UL;
   comm->connectRecv[peer] = 0UL;
   INFO(NCCL_INIT, "comm %p rank %d disconnected transport peer %d", comm, comm->rank, peer);
@@ -172,6 +177,62 @@ ncclResult_t ncclTransportCheckP2pType(struct ncclComm* comm, bool* isAllDirectP
   *isAllCudaP2p = cudaP2pFlag;
   INFO(NCCL_INIT, "Check P2P Type isAllDirectP2p %d directMode %d isAllCudaP2p %d", *isAllDirectP2p, *directMode,
        *isAllCudaP2p);
+  return ncclSuccess;
+}
+
+static ncclResult_t ncclTransportMarkP2pSendRecv(struct ncclComm* comm, int peer, bool isSendNotRecv,
+                                                 bool* needReconnect) {
+  int round = 0;
+  if (comm == NULL || needReconnect == NULL) return ncclInvalidArgument;
+  if (peer < 0 || peer >= comm->nRanks) return ncclInvalidArgument;
+  if (peer == comm->rank) return ncclSuccess;
+
+  while (round < comm->nRanks &&
+         peer != (isSendNotRecv ? comm->p2pSchedule[round].sendRank : comm->p2pSchedule[round].recvRank)) {
+    round += 1;
+  }
+  if (round == comm->nRanks) {
+    WARN("Could not find P2P schedule entry for rank %d %s peer %d", comm->rank,
+         isSendNotRecv ? "send" : "recv", peer);
+    return ncclInternalError;
+  }
+
+  uint8_t base = ncclP2pChannelBaseForRound(comm, round);
+  for (int c = 0; c < comm->p2pnChannelsPerPeer; c++) {
+    int channelId = ncclP2pChannelForPart(comm->p2pnChannels, base, c);
+    struct ncclChannel* channel = comm->channels + channelId;
+    if (channel->id == -1 || channel->peers == NULL || channel->peers[peer] == NULL) continue;
+    struct ncclConnector* conn = isSendNotRecv ? channel->peers[peer]->send + 1 : channel->peers[peer]->recv + 1;
+
+    conn->hasSeen = 1;
+    conn->p2pOnly = 1;
+    if (conn->transportComm == NULL) conn->connected = 0;
+    if (conn->connected == 0 || conn->transportComm == NULL) {
+      if (isSendNotRecv) comm->connectSend[peer] |= (1ULL << channelId);
+      else comm->connectRecv[peer] |= (1ULL << channelId);
+      *needReconnect = true;
+    }
+  }
+  return ncclSuccess;
+}
+
+ncclResult_t ncclTransportReconnectP2pSendRecv(struct ncclComm* comm) {
+  bool needReconnect = false;
+
+  if (comm == NULL) return ncclInvalidArgument;
+  if (!comm->p2pSendRecvSeen || comm->nRanks <= 1) return ncclSuccess;
+  if (!ncclCommIsRankActive(comm, comm->rank) || ncclCommCountActiveRanks(comm) <= 1) return ncclSuccess;
+
+  for (int peer = 0; peer < comm->nRanks; peer++) {
+    if (peer == comm->rank || !ncclCommIsRankActive(comm, peer)) continue;
+    NCCLCHECK(ncclTransportMarkP2pSendRecv(comm, peer, true, &needReconnect));
+    NCCLCHECK(ncclTransportMarkP2pSendRecv(comm, peer, false, &needReconnect));
+  }
+
+  if (needReconnect) {
+    INFO(NCCL_INIT, "comm %p rank %d reconnecting send/recv P2P transports after reshape", comm, comm->rank);
+    NCCLCHECK(ncclTransportP2pSetup(comm, NULL, 1));
+  }
   return ncclSuccess;
 }
 

@@ -727,6 +727,7 @@ struct ncclComm {
   int p2pnChannelsPerPeer;
   int p2pSchedGroupSize;
   int p2pMaxPeers;
+  bool p2pSendRecvSeen;
 
   // Should this comm allocate LL buffers for network P2P connections?
   bool allocP2pNetLLBuffers;

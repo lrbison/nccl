@@ -157,6 +157,7 @@ static ncclResult_t postTuneP2pRecordPreconnect(struct ncclComm* comm, int peer,
 
   if (peer < 0 || peer >= comm->nRanks) return ncclInvalidArgument;
   if (comm->rank == peer) return ncclSuccess;
+  comm->p2pSendRecvSeen = true;
   if (isSendNotRecv ? planner->peers[peer].sendSeen : planner->peers[peer].recvSeen) return ncclSuccess;
 
   NCCLCHECK(postTuneP2pChannelBase(comm, peer, isSendNotRecv, &base));

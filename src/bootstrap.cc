@@ -1606,6 +1606,7 @@ ncclResult_t bootstrapReshapeJoinerComplete(ncclComm_t comm, struct ncclSocket**
   NCCLCHECKGOTO(ncclDevrJoinExchangeWindows(comm), res, fail);
   comm->joinDeferred = false;
   NCCLCHECKGOTO(ncclTransportCollectiveConnect(comm), res, fail);
+  NCCLCHECKGOTO(ncclTransportReconnectP2pSendRecv(comm), res, fail);
 
 exit:
   free(newMask);
@@ -1706,6 +1707,7 @@ ncclResult_t bootstrapReshapeSurvivorsCommit(ncclComm_t comm, struct ncclReshape
   NCCLCHECKGOTO(ncclDevrJoinFinalizeGin(comm), res, fail);
   NCCLCHECKGOTO(ncclDevrJoinExchangeWindows(comm), res, fail);
   NCCLCHECKGOTO(ncclTransportCollectiveConnect(comm), res, fail);
+  NCCLCHECKGOTO(ncclTransportReconnectP2pSendRecv(comm), res, fail);
   if (isLeader)
     NCCLCHECKGOTO(bootstrapReshapeLeaderWaitJoiners(request, joinList, joinListLen, ncclSuccess), res, fail);
   /* TODO: leader should add new ras ranks. */

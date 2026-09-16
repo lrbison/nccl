@@ -150,6 +150,7 @@ ncclResult_t ncclTransportP2pSetup(struct ncclComm* comm, struct ncclTopoGraph* 
 ncclResult_t ncclTransportCheckP2pType(struct ncclComm* comm, bool* isAllDirectP2p, bool* directMode,
                                        bool* isAllCudaP2p);
 ncclResult_t ncclTransportClosePeer(struct ncclComm* comm, int peer);
+ncclResult_t ncclTransportReconnectP2pSendRecv(struct ncclComm* comm);
 ncclResult_t ncclTransportCollectiveConnect(struct ncclComm* comm);
 bool ncclP2pUsesMemcpy();
 
