@@ -1361,7 +1361,22 @@ ncclResult_t ncclDevrJoinExchangeWindows(struct ncclComm* comm) {
   }
 
   if (winCount == 0) goto exit;
-  for (struct ncclDevrMemory* mem = devr->memHead; mem != nullptr; mem = mem->next) {
+  for (int i = 0; i < devr->winSortedCount; i++) {
+    struct ncclDevrWindow* win = devr->winSorted[i].win;
+    struct ncclDevrMemory* mem = win != nullptr ? win->memory : nullptr;
+    bool alreadyRefreshed = false;
+    if (mem == nullptr) {
+      WARN("Reshape window exchange found malformed window entry %d", i);
+      ret = ncclInternalError;
+      goto exit;
+    }
+    for (int j = 0; j < i; j++) {
+      if (devr->winSorted[j].win != nullptr && devr->winSorted[j].win->memory == mem) {
+        alreadyRefreshed = true;
+        break;
+      }
+    }
+    if (alreadyRefreshed) continue;
     NCCLCHECKGOTO(symMemoryRefreshLsaTeam(comm, mem), ret, exit);
   }
   if ((size_t)winCount > INT_MAX / sizeof(*descs)) {
