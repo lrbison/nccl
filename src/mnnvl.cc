@@ -200,98 +200,9 @@ static void ncclMnnvlLogDiagnostics(struct ncclComm* comm, const char* phase) {
   ncclMnnvlLogImexChannels();
 }
 
-static void ncclMnnvlProbeFabricAllocation(struct ncclComm* comm, const char* phase) {
-  size_t size = CUDA_IPC_MIN;
-  size_t granularity = 0;
-  CUdevice currentDev = -1;
-  CUmemAllocationProp prop = {};
-  CUmemAccessDesc accessDesc = {};
-  CUmemGenericAllocationHandle handle = 0;
-  CUmemGenericAllocationHandle importedHandle = 0;
-  ncclCuDesc cuDesc;
-  CUdeviceptr ptr = 0;
-  int cudaDev = -1;
-  int gdrFlag = 0;
-  CUresult err;
-
-  memset(&cuDesc, 0, sizeof(cuDesc));
-  cudaError_t cudaErr = cudaGetDevice(&cudaDev);
-  if (cudaErr != cudaSuccess) {
-    INFO(NCCL_INIT, "MNNVL diag %s step cudaGetDevice failed %d(%s)", phase, cudaErr, cudaGetErrorString(cudaErr));
-    return;
-  }
-  err = CUPFN(cuDeviceGet(&currentDev, cudaDev));
-  INFO(NCCL_INIT, "MNNVL diag %s step cuDeviceGet cudaDev %d -> %d(%s) cuDev %d", phase, cudaDev, err,
-       ncclMnnvlCuErrorString(err), (int)currentDev);
-  if (err != CUDA_SUCCESS) return;
-
-  prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
-  prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-  prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_FABRIC;
-  prop.location.id = currentDev;
-  err = CUPFN(cuDeviceGetAttribute(&gdrFlag, CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_WITH_CUDA_VMM_SUPPORTED, currentDev));
-  INFO(NCCL_INIT, "MNNVL diag %s step gdrVmm attr -> %d(%s) value %d", phase, err, ncclMnnvlCuErrorString(err),
-       gdrFlag);
-  if (err == CUDA_SUCCESS && gdrFlag) prop.allocFlags.gpuDirectRDMACapable = 1;
-
-  err = CUPFN(cuMemGetAllocationGranularity(&granularity, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM));
-  INFO(NCCL_INIT, "MNNVL diag %s step cuMemGetAllocationGranularity type FABRIC gdrCapable %u -> %d(%s) gran %zu",
-       phase, prop.allocFlags.gpuDirectRDMACapable, err, ncclMnnvlCuErrorString(err), granularity);
-  if (err != CUDA_SUCCESS) return;
-  ALIGN_SIZE(size, granularity);
-
-  err = CUPFN(cuMemCreate(&handle, size, &prop, 0));
-  INFO(NCCL_INIT, "MNNVL diag %s step cuMemCreate size %zu type FABRIC dev %d gdrCapable %u -> %d(%s) handle 0x%llx",
-       phase, size, (int)currentDev, prop.allocFlags.gpuDirectRDMACapable, err, ncclMnnvlCuErrorString(err), handle);
-  if (err != CUDA_SUCCESS) return;
-
-  err = CUPFN(cuMemAddressReserve(&ptr, size, granularity, 0, 0));
-  INFO(NCCL_INIT, "MNNVL diag %s step cuMemAddressReserve size %zu gran %zu -> %d(%s) ptr %p", phase, size,
-       granularity, err, ncclMnnvlCuErrorString(err), (void*)ptr);
-  if (err != CUDA_SUCCESS) goto release_handle;
-
-  err = CUPFN(cuMemMap(ptr, size, 0, handle, 0));
-  INFO(NCCL_INIT, "MNNVL diag %s step cuMemMap ptr %p size %zu -> %d(%s)", phase, (void*)ptr, size, err,
-       ncclMnnvlCuErrorString(err));
-  if (err != CUDA_SUCCESS) goto free_addr;
-
-  accessDesc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-  accessDesc.location.id = currentDev;
-  accessDesc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-  err = CUPFN(cuMemSetAccess(ptr, size, &accessDesc, 1));
-  INFO(NCCL_INIT, "MNNVL diag %s step cuMemSetAccess ptr %p dev %d -> %d(%s)", phase, (void*)ptr, (int)currentDev,
-       err, ncclMnnvlCuErrorString(err));
-  if (err != CUDA_SUCCESS) goto unmap;
-
-  err = CUPFN(cuMemExportToShareableHandle(&cuDesc, handle, CU_MEM_HANDLE_TYPE_FABRIC, 0));
-  INFO(NCCL_INIT, "MNNVL diag %s step cuMemExportToShareableHandle type FABRIC -> %d(%s)", phase, err,
-       ncclMnnvlCuErrorString(err));
-  if (err != CUDA_SUCCESS) goto unmap;
-
-  err = CUPFN(cuMemImportFromShareableHandle(&importedHandle, &cuDesc, CU_MEM_HANDLE_TYPE_FABRIC));
-  INFO(NCCL_INIT, "MNNVL diag %s step cuMemImportFromShareableHandle type FABRIC -> %d(%s) handle 0x%llx",
-       phase, err, ncclMnnvlCuErrorString(err), importedHandle);
-  if (err == CUDA_SUCCESS) {
-    CUresult releaseErr = CUPFN(cuMemRelease(importedHandle));
-    INFO(NCCL_INIT, "MNNVL diag %s step cuMemRelease imported handle -> %d(%s)", phase, releaseErr,
-         ncclMnnvlCuErrorString(releaseErr));
-  }
-
-unmap:
-  err = CUPFN(cuMemUnmap(ptr, size));
-  INFO(NCCL_INIT, "MNNVL diag %s cleanup cuMemUnmap -> %d(%s)", phase, err, ncclMnnvlCuErrorString(err));
-free_addr:
-  err = CUPFN(cuMemAddressFree(ptr, size));
-  INFO(NCCL_INIT, "MNNVL diag %s cleanup cuMemAddressFree -> %d(%s)", phase, err, ncclMnnvlCuErrorString(err));
-release_handle:
-  err = CUPFN(cuMemRelease(handle));
-  INFO(NCCL_INIT, "MNNVL diag %s cleanup cuMemRelease original -> %d(%s)", phase, err, ncclMnnvlCuErrorString(err));
-}
-
 // Determine if MNNVL support is available
 ncclResult_t ncclMnnvlCheck(struct ncclComm* comm) {
   // MNNVL requires cuMem to be enabled
-  ncclMnnvlLogDiagnostics(comm, "entry");
   if (!ncclCuMemEnable()) {
     INFO(NCCL_INIT, "MNNVL disabled: cuMem is not enabled");
     return ncclSuccess;
@@ -364,7 +275,6 @@ ncclResult_t ncclMnnvlCheck(struct ncclComm* comm) {
       ncclCuMemAlloc(&ptr, &handle, CU_MEM_HANDLE_TYPE_FABRIC, CUDA_IPC_MIN, comm->memManager, ncclMemOffload);
     if (ret != ncclSuccess) {
       ncclMnnvlLogDiagnostics(comm, "alloc-failed");
-      ncclMnnvlProbeFabricAllocation(comm, "alloc-failed");
       // Return an error if this is a MNNVL capable system but FABRIC handles are not supported
       WARN("MNNVL (cliqueSize %d) is available but not working on this system. Check the IMEX channel configuration "
            "(/dev/nvidia-caps-imex-channels). Set NCCL_MNNVL_ENABLE=0 to ignore this issue.",
@@ -378,7 +288,6 @@ ncclResult_t ncclMnnvlCheck(struct ncclComm* comm) {
       (void)pfn_cuGetErrorString(err, &errStr);
       INFO(NCCL_INIT, "MNNVL FABRIC export/import failed with CUDA error %d '%s'", err, errStr);
       ncclMnnvlLogDiagnostics(comm, "export-import-failed");
-      ncclMnnvlProbeFabricAllocation(comm, "export-import-failed");
       NCCLCHECK(ncclCuMemFree(ptr, comm->memManager));
       // Return an error if this is a MNNVL capable system but it's not working
       WARN("MNNVL (cliqueSize %d) is available but not working on this system. Check the IMEX configuration "
